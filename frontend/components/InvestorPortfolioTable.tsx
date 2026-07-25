@@ -50,6 +50,7 @@ export default function InvestorPortfolioTable({ invoices }: Props) {
   const [sortKey, setSortKey] = useState<SortKey>('dueDate');
   const [sortDirection, setSortDirection] = useState<SortDirection>('asc');
   const [page, setPage] = useState(1);
+  const [sortAnnounce, setSortAnnounce] = useState('');
 
   const filteredInvoices = useMemo(() => {
     return invoices.filter((invoice) => {
@@ -75,10 +76,19 @@ export default function InvestorPortfolioTable({ invoices }: Props) {
   const handleSort = (key: SortKey) => {
     if (sortKey === key) {
       setSortDirection((prev) => (prev === 'asc' ? 'desc' : 'asc'));
+      setSortAnnounce(`Sorted by ${key} in descending order`);
       return;
     }
     setSortKey(key);
     setSortDirection('asc');
+    setSortAnnounce(`Sorted by ${key} in ascending order`);
+  };
+
+  const handleSortKeypress = (key: SortKey, event: React.KeyboardEvent) => {
+    if (event.key === 'Enter' || event.key === ' ') {
+      event.preventDefault();
+      handleSort(key);
+    }
   };
 
   const handlePageChange = (newPage: number) => {
@@ -98,49 +108,93 @@ export default function InvestorPortfolioTable({ invoices }: Props) {
   return (
     <div className="investor-table-card">
       <div className="table-controls">
-        <div className="filter-group">
-          <label>
+        <fieldset className="filter-group">
+          <legend className="sr-only">Filter invoices</legend>
+          <label htmlFor="status-filter">
             Status
-            <select value={statusFilter} onChange={(event) => { setStatusFilter(event.target.value as InvoiceStatus | 'ALL'); setPage(1); }}>
+            <select
+              id="status-filter"
+              value={statusFilter}
+              onChange={(event) => { setStatusFilter(event.target.value as InvoiceStatus | 'ALL'); setPage(1); }}
+              aria-label="Filter by invoice status"
+            >
               {STATUS_OPTIONS.map((status) => (
                 <option key={status} value={status}>{status}</option>
               ))}
             </select>
           </label>
-          <label>
+          <label htmlFor="token-filter">
             Token
-            <select value={tokenFilter} onChange={(event) => { setTokenFilter(event.target.value as TokenType | 'ALL'); setPage(1); }}>
+            <select
+              id="token-filter"
+              value={tokenFilter}
+              onChange={(event) => { setTokenFilter(event.target.value as TokenType | 'ALL'); setPage(1); }}
+              aria-label="Filter by token type"
+            >
               {TOKEN_OPTIONS.map((token) => (
                 <option key={token} value={token}>{token}</option>
               ))}
             </select>
           </label>
-        </div>
-        <div className="summary-text">
+        </fieldset>
+        <div className="summary-text" role="status" aria-live="polite">
           Showing {sortedInvoices.length} invoice{sortedInvoices.length === 1 ? '' : 's'}
         </div>
       </div>
 
       <div className="table-wrapper">
-        <table>
+        <table role="grid" aria-label="Investment portfolio">
+          <caption className="sr-only">List of funded invoices with amounts, rates, and status</caption>
           <thead>
-            <tr>
-              <th>Invoice ID</th>
-              <th>Farmer</th>
-              <th>Crop Type</th>
-              <th onClick={() => handleSort('fundedAmount')} className="sortable">
-                Funded Amount <span>{sortKey === 'fundedAmount' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}</span>
+            <tr role="row">
+              <th scope="col">Invoice ID</th>
+              <th scope="col">Farmer</th>
+              <th scope="col">Crop Type</th>
+              <th
+                scope="col"
+                role="button"
+                tabIndex={0}
+                onClick={() => handleSort('fundedAmount')}
+                onKeyDown={(e) => handleSortKeypress('fundedAmount', e)}
+                className="sortable"
+                aria-sort={sortKey === 'fundedAmount' ? (sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'}
+              >
+                Funded Amount <span aria-hidden="true">{sortKey === 'fundedAmount' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}</span>
               </th>
-              <th onClick={() => handleSort('discountRate')} className="sortable">
-                Discount Rate <span>{sortKey === 'discountRate' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}</span>
+              <th
+                scope="col"
+                role="button"
+                tabIndex={0}
+                onClick={() => handleSort('discountRate')}
+                onKeyDown={(e) => handleSortKeypress('discountRate', e)}
+                className="sortable"
+                aria-sort={sortKey === 'discountRate' ? (sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'}
+              >
+                Discount Rate <span aria-hidden="true">{sortKey === 'discountRate' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}</span>
               </th>
-              <th onClick={() => handleSort('expectedReturn')} className="sortable">
-                Expected Return <span>{sortKey === 'expectedReturn' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}</span>
+              <th
+                scope="col"
+                role="button"
+                tabIndex={0}
+                onClick={() => handleSort('expectedReturn')}
+                onKeyDown={(e) => handleSortKeypress('expectedReturn', e)}
+                className="sortable"
+                aria-sort={sortKey === 'expectedReturn' ? (sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'}
+              >
+                Expected Return <span aria-hidden="true">{sortKey === 'expectedReturn' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}</span>
               </th>
-              <th onClick={() => handleSort('dueDate')} className="sortable">
-                Due Date <span>{sortKey === 'dueDate' ? (sortDirection === 'asc' ? (sortDirection === 'asc' ? '▲' : '▼') : '') : ''}</span>
+              <th
+                scope="col"
+                role="button"
+                tabIndex={0}
+                onClick={() => handleSort('dueDate')}
+                onKeyDown={(e) => handleSortKeypress('dueDate', e)}
+                className="sortable"
+                aria-sort={sortKey === 'dueDate' ? (sortDirection === 'asc' ? 'ascending' : 'descending') : 'none'}
+              >
+                Due Date <span aria-hidden="true">{sortKey === 'dueDate' ? (sortDirection === 'asc' ? '▲' : '▼') : ''}</span>
               </th>
-              <th>Status</th>
+              <th scope="col">Status</th>
             </tr>
           </thead>
           <tbody>
@@ -164,14 +218,29 @@ export default function InvestorPortfolioTable({ invoices }: Props) {
         </table>
       </div>
 
-      <div className="pagination-controls">
-        <button type="button" onClick={() => handlePageChange(page - 1)} disabled={page === 1}>
+      <div className="pagination-controls" role="navigation" aria-label="Table pagination">
+        <button
+          type="button"
+          onClick={() => handlePageChange(page - 1)}
+          disabled={page === 1}
+          aria-label="Go to previous page"
+        >
           Previous
         </button>
-        <span>Page {page} of {pageCount}</span>
-        <button type="button" onClick={() => handlePageChange(page + 1)} disabled={page === pageCount}>
+        <span aria-live="polite" role="status">
+          Page {page} of {pageCount}
+        </span>
+        <button
+          type="button"
+          onClick={() => handlePageChange(page + 1)}
+          disabled={page === pageCount}
+          aria-label="Go to next page"
+        >
           Next
         </button>
+      </div>
+      <div aria-live="assertive" aria-atomic="true" className="sr-only">
+        {sortAnnounce}
       </div>
     </div>
   );
