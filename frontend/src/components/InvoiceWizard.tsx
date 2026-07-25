@@ -35,6 +35,7 @@ const stepOrder: StepKey[] = ['details', 'valuation', 'review', 'submitted'];
 export function InvoiceWizard() {
   const [currentStep, setCurrentStep] = useState<StepKey>('details');
   const [hasSubmitted, setHasSubmitted] = useState(false);
+  const [errorMessage, setErrorMessage] = useState('');
 
   const form = useForm<InvoiceForm>({
     resolver: zodResolver(invoiceSchema),
@@ -72,23 +73,32 @@ export function InvoiceWizard() {
   const goToStep = async (step: StepKey) => {
     if (step === 'details') {
       setCurrentStep(step);
+      setErrorMessage('');
       return;
     }
 
     const stepFields: Array<keyof InvoiceForm> = step === 'valuation'
-      ? ['cropName', 'cropDescription']
+      ? ['cropName', 'cropDescription', 'quantity', 'unit', 'unitPrice', 'currency', 'buyerName', 'buyerEmail']
       : step === 'review'
-      ? ['quantity', 'unit', 'unitPrice', 'currency', 'buyerName', 'buyerEmail']
+      ? []
       : [];
 
     if (stepFields.length === 0) {
       setCurrentStep(step);
+      setErrorMessage('');
       return;
     }
 
     const valid = await trigger(stepFields);
     if (valid) {
       setCurrentStep(step);
+      setErrorMessage('');
+    } else {
+      const errors = Object.entries(formState.errors)
+        .filter(([key]) => stepFields.includes(key as keyof InvoiceForm))
+        .map(([, error]) => (error as any)?.message)
+        .filter(Boolean);
+      setErrorMessage(`Validation errors: ${errors.join('. ')}`);
     }
   };
 
@@ -106,23 +116,35 @@ export function InvoiceWizard() {
       return (
         <fieldset className="wizard-panel" aria-labelledby="details-title">
           <legend id="details-title">Crop details</legend>
-          <label>
+          <label htmlFor="cropName">
             Crop name
             <input
+              id="cropName"
               type="text"
               {...form.register('cropName')}
               aria-invalid={!!form.formState.errors.cropName}
+              aria-describedby={form.formState.errors.cropName ? 'cropName-error' : undefined}
             />
-            <span className="field-error">{form.formState.errors.cropName?.message}</span>
+            {form.formState.errors.cropName && (
+              <span id="cropName-error" className="field-error" role="alert">
+                {form.formState.errors.cropName.message}
+              </span>
+            )}
           </label>
-          <label>
+          <label htmlFor="cropDescription">
             Crop description
             <textarea
+              id="cropDescription"
               rows={4}
               {...form.register('cropDescription')}
               aria-invalid={!!form.formState.errors.cropDescription}
+              aria-describedby={form.formState.errors.cropDescription ? 'cropDescription-error' : undefined}
             />
-            <span className="field-error">{form.formState.errors.cropDescription?.message}</span>
+            {form.formState.errors.cropDescription && (
+              <span id="cropDescription-error" className="field-error" role="alert">
+                {form.formState.errors.cropDescription.message}
+              </span>
+            )}
           </label>
           <div className="wizard-actions">
             <button type="button" className="primary" onClick={() => goToStep('valuation')}>
@@ -137,43 +159,85 @@ export function InvoiceWizard() {
       return (
         <fieldset className="wizard-panel" aria-labelledby="valuation-title">
           <legend id="valuation-title">Valuation</legend>
-          <label>
+          <label htmlFor="quantity">
             Quantity
             <input
+              id="quantity"
               type="number"
               min={1}
               step={1}
               {...form.register('quantity', { valueAsNumber: true })}
               aria-invalid={!!form.formState.errors.quantity}
+              aria-describedby={form.formState.errors.quantity ? 'quantity-error' : undefined}
             />
-            <span className="field-error">{form.formState.errors.quantity?.message}</span>
+            {form.formState.errors.quantity && (
+              <span id="quantity-error" className="field-error" role="alert">
+                {form.formState.errors.quantity.message}
+              </span>
+            )}
           </label>
-          <label>
+          <label htmlFor="unit">
             Unit
-            <select {...form.register('unit')}>
+            <select id="unit" {...form.register('unit')}>
               <option value="kg">kg</option>
               <option value="lbs">lbs</option>
               <option value="bags">bags</option>
             </select>
           </label>
-          <label>
+          <label htmlFor="unitPrice">
             Unit price
             <input
+              id="unitPrice"
               type="number"
               min={0.01}
               step={0.01}
               {...form.register('unitPrice', { valueAsNumber: true })}
               aria-invalid={!!form.formState.errors.unitPrice}
+              aria-describedby={form.formState.errors.unitPrice ? 'unitPrice-error' : undefined}
             />
-            <span className="field-error">{form.formState.errors.unitPrice?.message}</span>
+            {form.formState.errors.unitPrice && (
+              <span id="unitPrice-error" className="field-error" role="alert">
+                {form.formState.errors.unitPrice.message}
+              </span>
+            )}
           </label>
-          <label>
+          <label htmlFor="currency">
             Currency
-            <select {...form.register('currency')}>
+            <select id="currency" {...form.register('currency')}>
               <option value="USD">USD</option>
               <option value="XLM">XLM</option>
               <option value="EUR">EUR</option>
             </select>
+          </label>
+          <label htmlFor="buyerName">
+            Buyer name
+            <input
+              id="buyerName"
+              type="text"
+              {...form.register('buyerName')}
+              aria-invalid={!!form.formState.errors.buyerName}
+              aria-describedby={form.formState.errors.buyerName ? 'buyerName-error' : undefined}
+            />
+            {form.formState.errors.buyerName && (
+              <span id="buyerName-error" className="field-error" role="alert">
+                {form.formState.errors.buyerName.message}
+              </span>
+            )}
+          </label>
+          <label htmlFor="buyerEmail">
+            Buyer email
+            <input
+              id="buyerEmail"
+              type="email"
+              {...form.register('buyerEmail')}
+              aria-invalid={!!form.formState.errors.buyerEmail}
+              aria-describedby={form.formState.errors.buyerEmail ? 'buyerEmail-error' : undefined}
+            />
+            {form.formState.errors.buyerEmail && (
+              <span id="buyerEmail-error" className="field-error" role="alert">
+                {form.formState.errors.buyerEmail.message}
+              </span>
+            )}
           </label>
           <div className="wizard-actions">
             <button type="button" onClick={() => setCurrentStep('details')}>
@@ -236,8 +300,11 @@ export function InvoiceWizard() {
 
   return (
     <form className="wizard-shell" onSubmit={(event) => event.preventDefault()}>
+      <div role="status" aria-live="assertive" aria-atomic="true" className="sr-only">
+        {errorMessage}
+      </div>
       <div className="progress-wrapper" aria-label="Invoice creation progress">
-        <div className="progress-bar" style={{ width: `${progress}%` }} />
+        <div className="progress-bar" style={{ width: `${progress}%` }} aria-valuenow={Math.round(progress)} aria-valuemin={0} aria-valuemax={100} role="progressbar" />
         <div className="progress-labels">
           {stepOrder.slice(0, 3).map((step) => (
             <button
