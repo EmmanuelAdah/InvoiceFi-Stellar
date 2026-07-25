@@ -1,4 +1,4 @@
-import { Module } from '@nestjs/common';
+import { Module, MiddlewareConsumer, NestModule } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
 import { ComplianceModule } from './compliance/compliance.module';
@@ -7,6 +7,11 @@ import { InvoicesModule } from './invoices/invoices.module';
 import { PrismaModule } from './prisma/prisma.module';
 import { SettlementModule } from './settlement/settlement.module';
 import { MonitoringModule } from './monitoring/monitoring.module';
+import { VaultModule } from './config/vault/vault.module';
+import { RedisService } from './common/redis.service';
+import { RateLimiterService } from './common/rate-limiter.service';
+import { CircuitBreakerService } from './common/circuit-breaker.service';
+import { RateLimitMiddleware } from './common/rate-limit.middleware';
 
 @Module({
   imports: [
@@ -21,7 +26,11 @@ import { MonitoringModule } from './monitoring/monitoring.module';
     InvoicesModule,
     ComplianceModule,
     HealthModule,
-    ComplianceModule,
   ],
+  providers: [RedisService, RateLimiterService, CircuitBreakerService],
 })
-export class AppModule {}
+export class AppModule implements NestModule {
+  configure(consumer: MiddlewareConsumer) {
+    consumer.apply(RateLimitMiddleware).forRoutes('*');
+  }
+}
