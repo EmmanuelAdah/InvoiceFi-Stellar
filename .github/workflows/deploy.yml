@@ -1,0 +1,432 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# InvoiceFi-Stellar – Mainnet Deployment Pipeline
+#
+# Stages: Build → Test → Deploy-Staging → Smoke → Deploy-Production → Verify
+#
+# Blue-green switching for backend/frontend containers.
+# Contract WASM deployment with pre-flight soroban simulation.
+# Secrets managed via GitHub Environments with required reviewers for production.
+# ─────────────────────────────────────────────────────────────────────────────
+
+name: Mainnet Deployment Pipeline
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+      - "CONTRIBUTING.md"
+      - ".github/dependabot.yml"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Deployment target"
+        required: true
+        default: "staging"
+        type: choice
+        options:
+          - staging
+          - production
+      skip_ci:
+        description: "Skip CI checks (use on hotfix with already-green CI)"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false  # don't cancel an in-flight deployment
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_BACKEND: ${{ github.repository }}/backend
+  IMAGE_FRONTEND: ${{ github.repository }}/frontend
+  ACTIVE_COLOR_FILE: /tmp/active-color.txt
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  deployments: write
+
+# ── Build Stage ──────────────────────────────────────────────────────────────
+jobs:
+  build-backend:
+    name: Build Backend Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_BACKEND }}
+          tags: |
+            type=sha,prefix=backend-
+            type=raw,value=latest
+
+      - name: Build and push backend image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          file: ./backend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-frontend:
+    name: Build Frontend Image
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_FRONTEND }}
+          tags: |
+            type=sha,prefix=frontend-
+            type=raw,value=latest
+
+      - name: Build and push frontend image
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          file: ./frontend/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-contracts-wasm:
+    name: Build Contract WASM
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      wasm_artifacts: ${{ steps.upload.outputs.artifact-id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - name: Cache Cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            contracts/target
+          key: ${{ runner.os }}-cargo-wasm-${{ hashFiles('contracts/**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-wasm-
+
+      - name: Build WASM releases
+        working-directory: contracts
+        run: |
+          set -euo pipefail
+          for contract in invoice financing-pool settlement access-control; do
+            echo "::group::Building $contract WASM"
+            cargo build --release --target wasm32-unknown-unknown --manifest-path "$contract/Cargo.toml"
+            echo "::endgroup::"
+          done
+
+      - name: Collect WASM artifacts
+        run: |
+          mkdir -p /tmp/wasm-artifacts
+          find contracts/target/wasm32-unknown-unknown/release/ -name "*.wasm" -exec cp {} /tmp/wasm-artifacts/ \;
+          ls -la /tmp/wasm-artifacts/
+
+      - name: Upload WASM artifacts
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm
+          path: /tmp/wasm-artifacts/
+          retention-days: 7
+
+      - name: Run pre-flight soroban simulation
+        run: |
+          echo "::group::Contract Pre-flight Simulation"
+          chmod +x scripts/contract-simulate.sh
+          scripts/contract-simulate.sh /tmp/sim-results.json /tmp/sim-summary.md
+          echo "::endgroup::"
+          cat /tmp/sim-summary.md
+
+  # ── CI Gate ──────────────────────────────────────────────────────────────────
+  ci-gate:
+    name: CI Gate
+    needs: [build-backend, build-frontend, build-contracts-wasm]
+    if: ${{ !inputs.skip_ci }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Run backend tests
+        working-directory: backend
+        run: |
+          npm ci
+          npm test -- --runInBand
+
+      - name: Run frontend tests
+        working-directory: frontend
+        run: |
+          npm ci
+          npm test
+
+      - name: Run contract tests
+        uses: dtolnay/rust-toolchain@stable
+      - name: Contract unit tests
+        working-directory: contracts
+        run: cargo test --all
+
+  # ── Deploy Staging ───────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy to Staging
+    needs: [build-backend, build-frontend, build-contracts-wasm, ci-gate]
+    if: ${{ github.event.inputs.target == 'staging' || github.event.inputs.target == '' || github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    environment:
+      name: staging
+      url: ${{ steps.deploy-url.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9
+        with:
+          ssh-private-key: ${{ secrets.STAGING_SSH_KEY }}
+
+      - name: Determine active color (blue-green)
+        id: color
+        run: |
+          CURRENT=$(ssh -o StrictHostKeyChecking=no deploy@${{ secrets.STAGING_HOST }} "cat $ACTIVE_COLOR_FILE 2>/dev/null || echo 'blue'")
+          if [ "$CURRENT" = "blue" ]; then
+            echo "target=green" >> $GITHUB_OUTPUT
+            echo "idle=green" >> $GITHUB_OUTPUT
+          else
+            echo "target=blue" >> $GITHUB_OUTPUT
+            echo "idle=blue" >> $GITHUB_OUTPUT
+          fi
+          echo "active=$CURRENT" >> $GITHUB_OUTPUT
+
+      - name: Deploy backend (${{ steps.color.outputs.target }})
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_BACKEND }}:sha-${{ github.sha }}"
+          ssh deploy@${{ secrets.STAGING_HOST }} "
+            docker pull $TAG
+            docker tag $TAG invoicefi-backend:${{ steps.color.outputs.target }}
+            docker service update --image invoicefi-backend:${{ steps.color.outputs.target }} invoicefi_backend_${{ steps.color.outputs.target }}
+          "
+
+      - name: Deploy frontend (${{ steps.color.outputs.target }})
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_FRONTEND }}:sha-${{ github.sha }}"
+          ssh deploy@${{ secrets.STAGING_HOST }} "
+            docker pull $TAG
+            docker tag $TAG invoicefi-frontend:${{ steps.color.outputs.target }}
+            docker service update --image invoicefi-frontend:${{ steps.color.outputs.target }} invoicefi_frontend_${{ steps.color.outputs.target }}
+          "
+
+      - name: Deploy contract WASM (pre-flight simulated)
+        run: |
+          # Download WASM artifacts from build job
+          gh run download ${{ github.run_id }} -n contract-wasm -D /tmp/wasm-artifacts
+          ssh deploy@${{ secrets.STAGING_HOST }} "mkdir -p /opt/invoicefi/wasm"
+          scp /tmp/wasm-artifacts/*.wasm deploy@${{ secrets.STAGING_HOST }}:/opt/invoicefi/wasm/
+          ssh deploy@${{ secrets.STAGING_HOST }} "
+            for wasm in /opt/invoicefi/wasm/*.wasm; do
+              contract_name=\$(basename \$wasm .wasm)
+              echo \"Deploying \$contract_name WASM...\"
+              soroban contract install --wasm \$wasm --rpc-url \${{ secrets.STELLAR_RPC_URL }} --network-passphrase \"\${{ secrets.STELLAR_NETWORK_PASSPHRASE }}\"
+            done
+          "
+
+      - name: Record deployment color
+        run: |
+          ssh deploy@${{ secrets.STAGING_HOST }} "echo '${{ steps.color.outputs.target }}' > $ACTIVE_COLOR_FILE"
+
+      - name: Set deploy URL
+        id: deploy-url
+        run: echo "url=https://staging-${{ steps.color.outputs.target }}.invoicefi.app" >> $GITHUB_OUTPUT
+
+  # ── Smoke Test Gate ──────────────────────────────────────────────────────────
+  smoke-test:
+    name: Smoke Tests
+    needs: [deploy-staging]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run smoke tests against staging
+        run: |
+          chmod +x scripts/smoke-test.sh
+          scripts/smoke-test.sh \
+            --base-url "https://staging.invoicefi.app" \
+            --horizon-url "${{ secrets.STELLAR_HORIZON_URL }}" \
+            --timeout 300
+
+      - name: Check health endpoints
+        run: |
+          set -euo pipefail
+          # Backend health
+          BACKEND_HEALTH=$(curl -sf -o /dev/null -w "%{http_code}" https://staging.invoicefi.app/api/health || echo "000")
+          if [ "$BACKEND_HEALTH" != "200" ]; then
+            echo "::error::Backend health check returned $BACKEND_HEALTH"
+            exit 1
+          fi
+          # Frontend reachable
+          FRONTEND_CODE=$(curl -sf -o /dev/null -w "%{http_code}" https://staging.invoicefi.app || echo "000")
+          if [ "$FRONTEND_CODE" != "200" ]; then
+            echo "::error::Frontend returned $FRONTEND_CODE"
+            exit 1
+          fi
+          echo "✅ Health checks passed (backend=$BACKEND_HEALTH, frontend=$FRONTEND_CODE)"
+
+  # ── Deploy Production (requires reviewer) ────────────────────────────────────
+  deploy-production:
+    name: Deploy to Production
+    needs: [smoke-test]
+    if: ${{ github.event.inputs.target == 'production' || (github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch' && github.event.inputs.target == 'production') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment:
+      name: production
+      url: https://app.invoicefi.io
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH
+        uses: webfactory/ssh-agent@v0.9
+        with:
+          ssh-private-key: ${{ secrets.PRODUCTION_SSH_KEY }}
+
+      - name: Determine active color (blue-green)
+        id: color
+        run: |
+          CURRENT=$(ssh -o StrictHostKeyChecking=no deploy@${{ secrets.PRODUCTION_HOST }} "cat $ACTIVE_COLOR_FILE 2>/dev/null || echo 'blue'")
+          if [ "$CURRENT" = "blue" ]; then
+            echo "target=green" >> $GITHUB_OUTPUT
+          else
+            echo "target=blue" >> $GITHUB_OUTPUT
+          fi
+          echo "active=$CURRENT" >> $GITHUB_OUTPUT
+
+      - name: Deploy backend (${{ steps.color.outputs.target }})
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_BACKEND }}:sha-${{ github.sha }}"
+          ssh deploy@${{ secrets.PRODUCTION_HOST }} "
+            docker pull $TAG
+            docker tag $TAG invoicefi-backend:${{ steps.color.outputs.target }}
+            docker service update --image invoicefi-backend:${{ steps.color.outputs.target }} invoicefi_backend_${{ steps.color.outputs.target }}
+          "
+
+      - name: Deploy frontend (${{ steps.color.outputs.target }})
+        run: |
+          TAG="${{ env.REGISTRY }}/${{ env.IMAGE_FRONTEND }}:sha-${{ github.sha }}"
+          ssh deploy@${{ secrets.PRODUCTION_HOST }} "
+            docker pull $TAG
+            docker tag $TAG invoicefi-frontend:${{ steps.color.outputs.target }}
+            docker service update --image invoicefi-frontend:${{ steps.color.outputs.target }} invoicefi_frontend_${{ steps.color.outputs.target }}
+          "
+
+      - name: Deploy contract WASM (pre-flight verified)
+        run: |
+          gh run download ${{ github.run_id }} -n contract-wasm -D /tmp/wasm-artifacts
+          ssh deploy@${{ secrets.PRODUCTION_HOST }} "mkdir -p /opt/invoicefi/wasm"
+          scp /tmp/wasm-artifacts/*.wasm deploy@${{ secrets.PRODUCTION_HOST }}:/opt/invoicefi/wasm/
+          ssh deploy@${{ secrets.PRODUCTION_HOST }} "
+            for wasm in /opt/invoicefi/wasm/*.wasm; do
+              contract_name=\$(basename \$wasm .wasm)
+              echo \"Deploying \$contract_name WASM...\"
+              # Pre-flight simulate again against mainnet
+              soroban contract simulate --wasm \$wasm --rpc-url \${{ secrets.MAINNET_RPC_URL }} --network-passphrase \"Public Global Stellar Network ; September 2015\"
+              soroban contract install --wasm \$wasm --rpc-url \${{ secrets.MAINNET_RPC_URL }} --network-passphrase \"Public Global Stellar Network ; September 2015\"
+            done
+          "
+
+      - name: Switch traffic to new color (blue-green cutover)
+        run: |
+          ssh deploy@${{ secrets.PRODUCTION_HOST }} "
+            # Update load balancer to point to the new color
+            echo '${{ steps.color.outputs.target }}' > $ACTIVE_COLOR_FILE
+            # Reload nginx/traefik to pick up new upstream
+            docker exec invoicefi_lb nginx -s reload || docker service update --force invoicefi_lb || true
+          "
+
+      - name: Verify production deployment
+        run: |
+          set -euo pipefail
+          echo "::group::Production Health Check"
+          sleep 15  # Allow time for LB to propagate
+          for i in 1 2 3 4 5; do
+            CODE=$(curl -sf -o /dev/null -w "%{http_code}" https://app.invoicefi.io/api/health || echo "000")
+            if [ "$CODE" = "200" ]; then
+              echo "✅ Production backend healthy"
+              break
+            fi
+            echo "  Attempt $i: $CODE, retrying..."
+            sleep 5
+          done
+          if [ "$CODE" != "200" ]; then
+            echo "::error::Production health check failed after 5 retries"
+            exit 1
+          fi
+          echo "::endgroup::"
+
+      - name: Deploy verification notice
+        run: |
+          echo "✅ Production deployment complete"
+          echo "Deployed: sha-${{ github.sha }}"
+          echo "Color: ${{ steps.color.outputs.target }}"
+          echo "Previous active: ${{ steps.color.outputs.active }}"
