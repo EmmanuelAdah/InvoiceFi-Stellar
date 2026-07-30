@@ -562,3 +562,5 @@ impl SettlementTrait for SettlementContract {
 pub mod tests;
 #[cfg(test)]
 mod reentrancy_tests;
+#[cfg(test)]
+mod upgrade_tests;
