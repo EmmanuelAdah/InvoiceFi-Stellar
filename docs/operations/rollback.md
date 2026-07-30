@@ -1,189 +1,213 @@
-# InvoiceFi-Stellar – Rollback Procedure
+# Rollback Procedure
 
-> **Target completion time:** Under 10 minutes  
-> **Applies to:** Backend, Frontend, and Contract WASM deployments  
-> **Prerequisite:** The previous deployment's Docker images are still tagged as `:blue` or `:green` in the container registry.
+**Target:** Under 10 minutes from decision to full recovery.
 
----
+## Quick Reference
 
-## 1. Detection Triggers
-
-A rollback is warranted when any of the following occur after a deployment:
-
-- **Health check failure:** `GET /api/health` returns non-200 for >30s after cutover
-- **Error rate spike:** 5xx rate exceeds 5% of requests in a 1-minute window
-- **Smoke test regression:** A smoke test that passed pre-deployment now fails
-- **Contract transaction failure:** `soroban contract invoke` returns unexpected errors
-- **User-reported critical bug:** Confirmed by on-call engineer within 15 minutes of deployment
+| Scenario | Action | Time |
+|----------|--------|------|
+| Bad deployment (traffic already switched) | Swap back to old stack | 60s |
+| Contract failed pre-flight | Revert to previous WASM | 3 min |
+| Database migration issue | Restore from pg_dump | 5 min |
+| Full stack failure | Docker rollback + DNS revert | 5 min |
 
 ---
 
-## 2. Immediate Mitigation (First 60 Seconds)
+## 1. Traffic / Blue-Green Switchback (60s)
 
-### 2.1 Stop the bleeding
+If the new deployment is already serving live traffic:
 
 ```bash
-# SSH into the production host
-ssh deploy@<production-host>
+# Identify active and standby stacks
+docker compose ls
 
-# Check which color is currently active
-cat /tmp/active-color.txt  # Returns "blue" or "green"
+# For nginx/Caddy reverse proxy — reload upstream to old stack
+# Edit the proxy config to point at the OLD stack port and reload:
+ssh deploy@host
+sudo systemctl reload nginx    # or: caddy reload
+
+# Verify traffic routes correctly
+curl -sf https://invoicefi.io/health
+
+# Stop the bad stack (DO NOT remove volumes — keep for investigation)
+docker compose -p invoicefi-prod-<BAD_STACK> down --timeout 30
 ```
 
-### 2.2 Revert traffic to the previous color
+**Rollback always uses the previous stack's Docker images and volumes.**  
+The `latest` tag on ghcr.io is NOT rolled back — we re-deploy the previous `sha` tag:
 
 ```bash
-# If the incident happened DURING or IMMEDIATELY AFTER cutover,
-# the idle color still has the old, working deployment.
-# Simply switch the active color file and reload the load balancer:
-
-echo "<idle-color>" > /tmp/active-color.txt
-docker exec invoicefi_lb nginx -s reload
-
-# Example: if active=green and deployment broke, switch back to blue:
-# echo "blue" > /tmp/active-color.txt
-```
-
-### 2.3 Verify rollback
-
-```bash
-curl -sf -o /dev/null -w "%{http_code}" https://app.invoicefi.io/api/health
-# Expected: 200
-
-curl -sf https://app.invoicefi.io/api/health
-# Expected: {"status":"ok"}
+docker pull ghcr.io/nova-reward/invoicefi-stellar/backend:<PREVIOUS_SHA>
+docker tag ghcr.io/nova-reward/invoicefi-stellar/backend:<PREVIOUS_SHA> \
+             ghcr.io/nova-reward/invoicefi-stellar/backend:latest
+docker compose -f docker-compose.yml -p invoicefi-prod up --detach
 ```
 
 ---
 
-## 3. Full Rollback (Under 10 Minutes)
+## 2. Contract WASM Rollback (3 min)
 
-If the traffic switch alone doesn't resolve the issue (e.g., the idle environment also has problems), perform a full rollback.
+Soroban contract state changes are **irreversible**. You cannot "undo" a contract
+`upgrade` that changed storage. The rollback procedure for contracts is therefore a
+**re-deployment of the previous WASM under a new contract ID**, followed by updating
+references.
 
-### 3.1 Rollback Backend
-
-```bash
-ssh deploy@<production-host>
-
-# Identify the previous working image tag
-docker images invoicefi-backend --format "table {{.Tag}}\t{{.CreatedAt}}" | head -10
-# Pick the tag from before the failed deployment (e.g., sha-abc123def)
-
-# Rollback the Docker service
-docker service update \
-  --image invoicefi-backend:sha-abc123def \
-  invoicefi_backend_<color>
-```
-
-### 3.2 Rollback Frontend
+### Pre-flight verification (always do this before any rollback)
 
 ```bash
-docker images invoicefi-frontend --format "table {{.Tag}}\t{{.CreatedAt}}" | head -10
-# Pick the tag from before the failed deployment
-
-docker service update \
-  --image invoicefi-frontend:sha-abc123def \
-  invoicefi_frontend_<color>
+# Simulate the PREVIOUS WASM against current state to verify compatibility
+soroban contract simulate \
+  --wasm /tmp/wasm-artifacts/<previous-contract>.wasm \
+  --function initialize \
+  --rpc-url https://soroban-mainnet.stellar.org
 ```
 
-### 3.3 Rollback Contract WASM
-
-Contract rollbacks are **different** from container rollbacks. Soroban contract state changes
-are irreversible once committed. The rollback strategy is:
-
-1. **Install the previous WASM version** as a new contract instance:
-   ```bash
-   soroban contract install \
-     --wasm /opt/invoicefi/wasm/<contract>_<previous-sha>.wasm \
-     --rpc-url $MAINNET_RPC_URL \
-     --network-passphrase "Public Global Stellar Network ; September 2015"
-   ```
-
-2. **Upgrade the contract** to point to the previous WASM hash:
-   ```bash
-   soroban contract upgrade \
-     --id $CONTRACT_ID \
-     --wasm-hash <previous-wasm-hash> \
-     --rpc-url $MAINNET_RPC_URL
-   ```
-
-3. **Verify** the contract is running the expected version:
-   ```bash
-   soroban contract invoke \
-     --id $CONTRACT_ID \
-     --fn version \
-     --rpc-url $MAINNET_RPC_URL
-   ```
-
-> **Contract rollback caveats:**
-> - State schema changes between versions may cause migration issues
-> - Always verify with a `--simulate` call before the state-changing upgrade
-> - If the state schema changed incompatibly, you may need a migration contract
-
----
-
-## 4. Post-Rollback Verification
+### Rollback steps
 
 ```bash
-# ── Health check ──
-curl -sf https://app.invoicefi.io/api/health
+# 1. Deploy the previous WASM as a new contract instance
+CONTRACT_ID=$(soroban contract deploy \
+  --wasm /tmp/wasm-artifacts/<previous-contract>.wasm \
+  --source <ADMIN_SECRET_KEY> \
+  --network mainnet \
+  --rpc-url https://soroban-mainnet.stellar.org)
 
-# ── API smoke ──
-curl -sf https://app.invoicefi.io/api/metrics | head -5
+echo "New contract instance: $CONTRACT_ID"
 
-# ── Transaction verification ──
-# Send a test transaction through the repro path
-soroban contract invoke \
-  --id $INVOICE_CONTRACT_ID \
-  --fn total_minted \
-  --rpc-url $MAINNET_RPC_URL
+# 2. Update the backend environment to point at the new contract instance
+ssh deploy@host
+sed -i "s/^INVOICE_CONTRACT_ID=.*/INVOICE_CONTRACT_ID=$CONTRACT_ID/" .env
 
-# ── Monitor logs for 2 minutes ──
-ssh deploy@<production-host> "journalctl -u invoicefi-backend -n 50 --no-pager"
+# 3. Restart backend to pick up the new contract reference
+docker compose -p invoicefi-prod restart backend
+
+# 4. Verify the new contract responds correctly
+curl -sf https://invoicefi.io/contracts/invoice/admin
+```
+
+**Important:** Because `upgrade` is not reversible, the recommended deployment
+strategy is to **always deploy new WASM versions as new contract instances** and
+update the backend config, rather than using `soroban contract upgrade`. This
+preserves the ability to roll back by re-pointing config.
+
+---
+
+## 3. Database Rollback (5 min)
+
+Database rollbacks require a pre-deployment `pg_dump` snapshot. The deployment
+pipeline should create this automatically before any migration runs.
+
+### Automatic pre-deployment snapshot
+
+```bash
+# This runs in the deploy-staging job before Prisma migrations
+PGPASSWORD=$POSTGRES_PASSWORD pg_dump \
+  -h localhost \
+  -U $POSTGRES_USER \
+  -d $POSTGRES_DB \
+  --format=custom \
+  -f /tmp/pre-deploy-dump-$(date +%Y%m%d_%H%M%S).pgdump
+```
+
+### Manual restore
+
+```bash
+# 1. Stop the backend (prevents writes during restore)
+docker compose -p invoicefi-prod stop backend
+
+# 2. Restore the pre-deployment snapshot
+PGPASSWORD=$POSTGRES_PASSWORD pg_restore \
+  -h localhost \
+  -U $POSTGRES_USER \
+  -d $POSTGRES_DB \
+  --clean --if-exists \
+  /tmp/pre-deploy-dump-<TIMESTAMP>.pgdump
+
+# 3. Roll back the backend image (see section 1)
+# 4. Restart
+docker compose -p invoicefi-prod start backend
+
+# 5. Verify
+curl -sf https://invoicefi.io/health
 ```
 
 ---
 
-## 5. Post-Mortem
+## 4. Quick-Start Rollback Script
 
-After the rollback is complete and service is restored:
+Save this as `/opt/invoicefi/rollback.sh` on production hosts:
 
-1. **Tag the failing deployment** in your monitoring system (e.g., rollback-trigger event)
-2. **Create a GitHub issue** documenting:
-   - What was deployed (commit SHA)
-   - Failure symptom
-   - Rollback duration
-   - Root cause (once determined)
-3. **Block the failing commit** from re-deploying until fixed (add to `.github/deploy-blocklist`)
-4. **Restore from deploy-blocklist** after the fix is merged:
-   ```bash
-   # Remove the commit SHA from deploy-blocklist
-   git rm .github/deploy-blocklist/<sha>
-   ```
+```bash
+#!/usr/bin/env bash
+# Usage: sudo bash rollback.sh [--db] [--contracts]
+set -euo pipefail
+
+SNAPSHOT="${1:-/tmp/pre-deploy-dump.latest.pgdump}"
+STACK="${2:-blue}"
+
+echo "=== Rollback to $STACK stack ==="
+
+# 1. Traffic switch
+docker compose -p "invoicefi-prod-$STACK" up --detach
+sleep 10
+curl -sf http://localhost:4000/health || { echo "Backend not healthy"; exit 1; }
+
+# 2. Switch proxy to $STACK ports
+# (edit proxy config here)
+
+echo "=== Traffic switched to $STACK ==="
+
+# 3. Database rollback (if --db flag)
+if [[ "${1:-}" == "--db" ]]; then
+  echo "Restoring database from $SNAPSHOT ..."
+  docker compose -p invoicefi-prod stop backend
+  pg_restore --clean --if-exists -d invoicefi "$SNAPSHOT"
+  docker compose -p invoicefi-prod start backend
+  echo "Database restored."
+fi
+
+echo "=== Rollback complete ==="
+```
 
 ---
 
-## 6. Automation (Recommended)
+## 5. Post-Rollback Verification
 
-For faster rollbacks, consider setting up:
+After any rollback, run:
 
-1. **Automated health-check watcher** — A cron job that polls `/api/health` every 30s
-   and triggers an automatic rollback after 3 consecutive failures
-2. **GitHub Actions rollback dispatch** — A `workflow_dispatch` action that:
-   - Reads the last known good deployment from deployment history
-   - Re-deploys the previous commit
-3. **Slack/PagerDuty integration** — Alert the on-call engineer when a rollback occurs
+```bash
+# Smoke test
+bash scripts/smoke-test.sh \
+  --base-url https://invoicefi.io \
+  --horizon-url https://horizon.stellar.org \
+  --verbose
+
+# Verify contract state (if contracts were rolled back)
+curl -sf https://invoicefi.io/contracts/invoice/admin
+curl -sf https://invoicefi.io/pool/status
+
+# Check database integrity
+curl -sf https://invoicefi.io/health/db | python3 -m json.tool
+
+# Check recent errors
+docker compose -p invoicefi-prod logs --tail=50 backend | grep -i error || echo "No errors"
+
+echo "=== Rollback verified ==="
+```
 
 ---
 
-## Appendix: Quick-Reference Commands
+## Operational Notes
 
-| Action | Command |
-|--------|---------|
-| Check active color | `cat /tmp/active-color.txt` |
-| Switch traffic | `echo "<color>" > /tmp/active-color.txt && docker exec invoicefi_lb nginx -s reload` |
-| Health check | `curl -sf https://app.invoicefi.io/api/health` |
-| View recent logs | `ssh deploy@<host> "journalctl -u invoicefi-backend -n 100 --no-pager"` |
-| List backend images | `docker images invoicefi-backend` |
-| Rollback service | `docker service update --image invoicefi-backend:<tag> invoicefi_backend_<color>` |
-| Contract version | `soroban contract invoke --id $ID --fn version` |
+- **Deployments are idempotent.** Running the same pipeline twice with the same
+  image SHA produces the same result.
+- **Contract WASM is immutable per network.** Deploy a new contract instance
+  rather than upgrading an existing one. This makes rollback config-only (update
+  contract ID in env).
+- **Database migrations should be backward-compatible for 1 release.** This
+  allows running the old backend code against the new schema during a blue-green
+  transition. Prisma `migrate deploy` runs automatically on backend startup.
+- **Secrets are managed via GitHub Environments** (`staging`, `production`) with
+  required reviewers for production deploys. The `STAGING_SSH_KEY`, `PRODUCTION_SSH_KEY`,
+  `STAGING_HOST`, `PRODUCTION_HOST`, and their user secrets must be configured in
+  the repo settings before the pipeline first runs.

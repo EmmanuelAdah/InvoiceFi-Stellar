@@ -2,150 +2,220 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # InvoiceFi-Stellar – Smoke Test Suite
 #
-# Runs against a deployed environment to verify basic functionality before
-# traffic is cut over in a blue-green deployment.
+# Runs a battery of health and integration checks against a deployed stack.
+# Succeeds (exit 0) only if ALL checks pass. Used as the deployment gate
+# between staging and production — a failing smoke test blocks the cutover.
 #
 # Usage:
-#   scripts/smoke-test.sh --base-url https://staging.invoicefi.app [options]
+#   bash scripts/smoke-test.sh [--flags]
 #
-# Options:
-#   --base-url <URL>       Base URL of the deployment (required)
-#   --horizon-url <URL>    Horizon RPC URL for Stellar checks
-#   --timeout <seconds>    Max time per test (default: 60)
-#   --verbose              Show detailed test output
+# Flags:
+#   --base-url URL      Base URL of the deployed API (default: http://localhost:4000)
+#   --horizon-url URL   Stellar Horizon URL for chain queries (default: http://localhost:8000)
+#   --timeout SECS      Max seconds per check (default: 15)
+#   --verbose           Print detailed pass/fail per check
+#   --help              Show this help message
+#
+# Exit codes:
+#   0  All checks passed
+#   1  One or more checks failed (gate the cutover)
 # ─────────────────────────────────────────────────────────────────────────────
-
 set -euo pipefail
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-FAILED=0
+# ── Defaults ────────────────────────────────────────────────────────────────
+BASE_URL="http://localhost:4000"
+HORIZON_URL="http://localhost:8000"
+TIMEOUT=15
 VERBOSE=false
 
 # ── Parse arguments ──────────────────────────────────────────────────────────
-BASE_URL=""
-HORIZON_URL=""
-TIMEOUT=60
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --base-url)    BASE_URL="$2";  shift 2 ;;
+    --base-url)    BASE_URL="$2";    shift 2 ;;
     --horizon-url) HORIZON_URL="$2"; shift 2 ;;
-    --timeout)     TIMEOUT="$2";   shift 2 ;;
-    --verbose)     VERBOSE=true;   shift ;;
-    *) echo "::error::Unknown argument: $1"; exit 2 ;;
+    --timeout)     TIMEOUT="$2";     shift 2 ;;
+    --verbose)     VERBOSE=true;     shift   ;;
+    --help|-h)
+      sed -n '/^# Usage:/,/^exit codes:/p' "$0" | sed 's/^# //'
+      exit 0
+      ;;
+    *) echo "Unknown option: $1"; exit 2 ;;
   esac
 done
 
-if [[ -z "$BASE_URL" ]]; then
-  echo "::error::--base-url is required"
-  exit 2
-fi
-
-# Strip trailing slash
-BASE_URL="${BASE_URL%/}"
+# ── Globals ──────────────────────────────────────────────────────────────────
+PASS_COUNT=0
+FAIL_COUNT=0
+declare -a FAILURES
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
-pass()     { echo "  ✅ $1"; }
-fail()     { echo "  ❌ $1"; FAILED=$((FAILED + 1)); }
-info()     { echo "  ℹ️ $1"; }
-section()  { echo ""; echo "━━━ $1 ━━━"; }
-header()   { echo ""; echo "═══════════════════════════════════════════════════"; echo " $1"; echo "═══════════════════════════════════════════════════"; }
+pass() {
+  PASS_COUNT=$((PASS_COUNT + 1))
+  if [[ "$VERBOSE" == true ]]; then echo "  ✅ $1"; fi
+}
 
-http_check() {
-  local desc="$1" url="$2" expected_code="${3:-200}"
-  local code
-  code=$(curl -sf -o /dev/null -w "%{http_code}" --max-time "$TIMEOUT" "$url" 2>/dev/null || echo "000")
-  if [[ "$code" == "$expected_code" ]]; then
-    pass "$desc (HTTP $code)"
-    return 0
+fail() {
+  FAIL_COUNT=$((FAIL_COUNT + 1))
+  FAILURES+=("$1: $2")
+  if [[ "$VERBOSE" == true ]]; then echo "  ❌ $1 — $2"; fi
+}
+
+check_http() {
+  local label="$1"
+  local url="$2"
+  local expected_status="${3:-200}"
+  local result
+
+  result=$(curl -sSf -o /dev/null -w '%{http_code}' \
+    --max-time "$TIMEOUT" \
+    "$url" 2>&1 || true)
+
+  if [[ "$result" == "$expected_status" ]]; then
+    pass "$label"
   else
-    fail "$desc — expected $expected_code, got $code"
-    return 1
+    fail "$label" "HTTP $result (expected $expected_status)"
   fi
 }
 
-json_field_check() {
-  local desc="$1" url="$2" field="$3" expected="$4"
-  local value
-  value=$(curl -sf --max-time "$TIMEOUT" "$url" 2>/dev/null | python3 -c "import sys,json; print(json.load(sys.stdin).get('$field','__MISSING__'))" 2>/dev/null || echo "__FAILED__")
-  if [[ "$value" == "$expected" ]]; then
-    pass "$desc ($field=$expected)"
-    return 0
+check_json_field() {
+  local label="$1"
+  local url="$2"
+  local field="$3"
+  local expected_value="$4"
+  local result
+
+  result=$(curl -sS --max-time "$TIMEOUT" "$url" 2>/dev/null || echo '{}')
+  local actual
+  actual=$(echo "$result" | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    val = d
+    for part in '$field'.split('.'):
+        val = val.get(part, '')
+    print(str(val).lower())
+except Exception:
+    print('parse_error')
+" 2>/dev/null || echo 'fetch_error')
+
+  if [[ "$actual" == "$expected_value" ]]; then
+    pass "$label"
   else
-    fail "$desc — expected $field=$expected, got $value"
-    return 1
+    fail "$label" "expected $field=$expected_value, got $actual"
   fi
 }
 
-# ── Run smoke tests ──────────────────────────────────────────────────────────
-header "InvoiceFi-Stellar Smoke Test Suite"
-info "Target: $BASE_URL"
-info "Timeout: ${TIMEOUT}s"
-info "Started: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo ""
+check_horizon() {
+  local label="$1"
+  local result
 
-# ── 1. Health checks ──────────────────────────────────────────────────────────
-section "1. Health & Connectivity"
+  result=$(curl -sS -o /dev/null -w '%{http_code}' \
+    --max-time "$TIMEOUT" \
+    "$HORIZON_URL" 2>&1 || true)
 
-http_check "Backend /api/health" "$BASE_URL/api/health" 200
-http_check "Frontend index" "$BASE_URL/" 200
-http_check "Frontend /app route" "$BASE_URL/app" 200
+  if [[ "$result" == "200" ]]; then
+    pass "$label — Horizon reachable"
+  else
+    fail "$label" "Horizon HTTP $result (expected 200)"
+  fi
+}
 
-# ── 2. API endpoints ──────────────────────────────────────────────────────────
-section "2. API Core Endpoints"
+check_horizon_liveness() {
+  local label="$1"
+  local result
 
-# Public endpoints (no auth required)
-http_check "API /api/metrics" "$BASE_URL/api/metrics" 200
+  # Check if Horizon is catching up / healthy
+  result=$(curl -sS --max-time "$TIMEOUT" \
+    "$HORIZON_URL" 2>/dev/null | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('core_latest_ledger', 0) > 0)
+except Exception:
+    print('false')
+" 2>/dev/null || echo 'false')
 
-# Check JSON response shape — health endpoint should return status
-json_field_check "Health response shape" "$BASE_URL/api/health" "status" "ok" 2>/dev/null || \
-  json_field_check "Health response shape (alt)" "$BASE_URL/api/health" "healthy" "true" 2>/dev/null || \
-  info "Health response shape unknown (not blocking)"
+  if [[ "$result" == "True" ]]; then
+    pass "$label — Horizon has latest ledger"
+  else
+    fail "$label" "Horizon not healthy or no ledger data"
+  fi
+}
 
-# ── 3. Contract endpoints ──────────────────────────────────────────────────────
-section "3. Contract Read Queries"
+# ── Test Suites ──────────────────────────────────────────────────────────────
 
-if [[ -n "$HORIZON_URL" ]]; then
-  http_check "Horizon reachable" "$HORIZON_URL" 200
-  json_field_check "Horizon network passphrase" "$HORIZON_URL" "network_passphrase" "Public Global Stellar Network ; September 2015" 2>/dev/null || \
-    info "Horizon network passphrase check skipped (not mainnet = expected)"
-else
-  info "Horizon URL not provided — skipping Stellar network checks"
-fi
-
-# ── 4. Environment configuration ──────────────────────────────────────────────
-section "4. Configuration"
-
-# Check that production headers are set
-CSP=$(curl -sf -o /dev/null -w "%{header_content_security_policy}" "$BASE_URL" 2>/dev/null || echo "")
-if [[ -n "$CSP" ]]; then
-  pass "Content-Security-Policy header present"
-else
-  info "CSP header not checked (may not be set at reverse proxy level)"
-fi
-
-# ── 5. Response time check ─────────────────────────────────────────────────────
-section "5. Performance (under threshold)"
-
-TIMING=$(curl -sf -w "%{time_total}" -o /dev/null --max-time "$TIMEOUT" "$BASE_URL/api/health" 2>/dev/null || echo "999")
-if (( $(echo "$TIMING < 3.0" | bc -l) )); then
-  pass "API response time: ${TIMING}s (threshold: 3.0s)"
-else
-  fail "API response time: ${TIMING}s (exceeds 3.0s threshold)"
-fi
-
-# ── Results ────────────────────────────────────────────────────────────────────
-header "Results"
-echo ""
-if [[ "$FAILED" -eq 0 ]]; then
-  echo "🎉 All smoke tests passed!"
+suite_header() {
   echo ""
-  echo "Ready for traffic cutover."
-else
-  echo "⚠️  $FAILED smoke test(s) failed."
-  echo "Review failures above before proceeding with cutover."
-fi
-echo ""
-info "Finished: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "═══════════════════════════════════════════════"
+  echo "  $1"
+  echo "═══════════════════════════════════════════════"
+}
 
-exit "$FAILED"
+# ── 1. API Health ────────────────────────────────────────────────────────────
+suite_header "API Health Checks"
+
+check_http "Backend health endpoint"           "$BASE_URL/health" 200
+check_http "Root endpoint reachable"           "$BASE_URL/"       200
+check_json_field "API version field present"   "$BASE_URL/health" "status" "ok"
+
+# ── 2. API Core Endpoints ────────────────────────────────────────────────────
+suite_header "API Core Endpoints"
+
+check_http "Invoice list endpoint"             "$BASE_URL/invoices"      200
+check_http "Pool status endpoint"             "$BASE_URL/pool/status"    200
+check_http "Settlement status endpoint"       "$BASE_URL/settlements"    200
+check_http "Auth challenge endpoint"          "$BASE_URL/auth/challenge" 200
+
+# ── 3. Stellar Network ───────────────────────────────────────────────────────
+suite_header "Stellar Network"
+
+check_horizon "Horizon API reachable"
+check_horizon_liveness "Horizon ledger sync"
+
+# ── 4. Database Connectivity ──────────────────────────────────────────────────
+suite_header "Database Connectivity"
+
+check_json_field "DB migration status" "$BASE_URL/health" "database.connected" "true"
+check_http "Prisma migrate status"     "$BASE_URL/health/db" 200
+
+# ── 5. Contract Deployment (read queries) ─────────────────────────────────────
+suite_header "Contract Read Queries"
+
+# Invoice contract — admin() read
+check_http "Invoice contract admin query"        "$BASE_URL/contracts/invoice/admin" 200
+# Financing pool — liquidity query
+check_http "Pool liquidity query"                 "$BASE_URL/contracts/pool/liquidity" 200
+
+# ── 6. Security Headers ──────────────────────────────────────────────────────
+suite_header "Security Headers"
+
+local STS_HEADER
+STS_HEADER=$(curl -sS --max-time "$TIMEOUT" -I "$BASE_URL/health" 2>/dev/null | grep -i 'strict-transport-security' || true)
+if [[ -n "$STS_HEADER" ]]; then
+  pass "Strict-Transport-Security header present"
+else
+  fail "Security Headers" "Missing Strict-Transport-Security header"
+fi
+
+# ── Summary ──────────────────────────────────────────────────────────────────
+echo ""
+echo "═══════════════════════════════════════════════"
+echo "  Smoke Test Summary"
+echo "═══════════════════════════════════════════════"
+echo "  Passed: $PASS_COUNT"
+echo "  Failed: $FAIL_COUNT"
+echo ""
+
+if [[ "$FAIL_COUNT" -gt 0 ]]; then
+  echo "  ❌ FAILURES:"
+  for f in "${FAILURES[@]}"; do
+    echo "     • $f"
+  done
+  echo ""
+  echo "  ❌ SMOKE TEST FAILED — deployment cutover blocked."
+  echo "     Investigate the failures above and re-run."
+  exit 1
+fi
+
+echo "  ✅ ALL CHECKS PASSED — deployment is healthy."
+exit 0
