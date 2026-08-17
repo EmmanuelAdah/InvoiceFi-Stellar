@@ -8,6 +8,12 @@ import { PrismaClient } from '@prisma/client';
 import { VaultService } from '../config/vault/vault.service';
 
 /**
+ * The interactive-transaction callback signature supported by PrismaClient.
+ * Typed narrowly to avoid pulling in the full internal Prisma namespace.
+ */
+type TransactionCallback<T> = (tx: Omit<PrismaClient, '$connect' | '$disconnect' | '$on' | '$transaction' | '$use' | '$extends'>) => Promise<T>;
+
+/**
  * PrismaService
  *
  * Wraps PrismaClient with two enhancements:
@@ -75,6 +81,28 @@ export class PrismaService implements OnModuleInit, OnModuleDestroy {
 
   get syncCursor() {
     return this.client.syncCursor;
+  }
+
+  get exportJob() {
+    return this.client.exportJob;
+  }
+
+  /**
+   * Delegates to PrismaClient.$transaction, supporting both the interactive
+   * callback form and the sequential operations array form.
+   *
+   *   // Interactive (used by settlement and sync services):
+   *   await this.prisma.$transaction(async (tx) => { … });
+   *
+   *   // Sequential array (used by financing-pool service):
+   *   await this.prisma.$transaction([op1, op2]);
+   */
+  $transaction<T>(
+    fn: Parameters<PrismaClient['$transaction']>[0],
+    options?: Parameters<PrismaClient['$transaction']>[1],
+  ): Promise<T> {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    return (this.client.$transaction as any)(fn, options) as Promise<T>;
   }
 
   // Extend with additional model getters as the Prisma schema grows.
