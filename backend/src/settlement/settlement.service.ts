@@ -1,6 +1,7 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InvoiceStatus, PrismaClient } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { WebhookDispatchService } from '../webhooks/webhook-dispatch.service';
 
 export enum SettlementResult {
   /** The invoice transitioned FUNDED -> REPAID. */
@@ -35,7 +36,10 @@ export type SettlementTxClient = Pick<PrismaClient, 'invoice'>;
 export class SettlementService {
   private readonly logger = new Logger(SettlementService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly webhookDispatch: WebhookDispatchService,
+  ) {}
 
   /**
    * Apply an on-chain settlement to the database, transitioning the invoice
@@ -45,6 +49,11 @@ export class SettlementService {
    * so concurrent calls cannot double-apply. The operation is idempotent: a
    * replayed or retried event for an already-REPAID invoice resolves to
    * {@link SettlementResult.ALREADY_REPAID} instead of erroring.
+   *
+   * On a fresh settlement, enqueues a `repaid` webhook event for any
+   * registered subscribers. Enqueueing only writes a queue row (see
+   * `WebhookDispatchService`), so a broken subscriber can never fail or
+   * delay settlement itself.
    */
   async settleInvoice(
     invoiceId: string,
@@ -72,14 +81,15 @@ export class SettlementService {
   ): Promise<SettlementResult> {
     const onchainId = BigInt(invoiceId);
 
-    const updated = await tx.invoice.updateMany({
-      where: { onchainId, status: InvoiceStatus.FUNDED },
-      data: {
-        status: InvoiceStatus.REPAID,
-        settledLedger: ledger,
-        settledAt: new Date(),
-      },
-    });
+    const result = await this.prisma.db.$transaction(async (tx) => {
+      const updated = await tx.invoice.updateMany({
+        where: { onchainId, status: InvoiceStatus.FUNDED },
+        data: {
+          status: InvoiceStatus.REPAID,
+          settledLedger: ledger,
+          settledAt: new Date(),
+        },
+      });
 
     if (updated.count > 0) {
       this.logger.log(
@@ -88,17 +98,29 @@ export class SettlementService {
       return SettlementResult.SETTLED;
     }
 
-    // No row moved — figure out why so the caller can decide on retries.
-    const existing = await tx.invoice.findUnique({ where: { onchainId } });
-    if (!existing) {
-      throw new InvoiceNotFoundError(invoiceId);
+      // No row moved — figure out why so the caller can decide on retries.
+      const existing = await tx.invoice.findUnique({ where: { onchainId } });
+      if (!existing) {
+        throw new InvoiceNotFoundError(invoiceId);
+      }
+      if (existing.status === InvoiceStatus.REPAID) {
+        this.logger.debug(
+          `Invoice ${invoiceId} already REPAID; skipping (idempotent).`,
+        );
+        return SettlementResult.ALREADY_REPAID;
+      }
+      throw new UnexpectedInvoiceStatusError(invoiceId, existing.status);
+    });
+
+    if (result === SettlementResult.SETTLED) {
+      await this.webhookDispatch.dispatchInvoiceEvent({
+        invoiceId,
+        event: 'repaid',
+        timestamp: new Date().toISOString(),
+        data: { ledger },
+      });
     }
-    if (existing.status === InvoiceStatus.REPAID) {
-      this.logger.debug(
-        `Invoice ${invoiceId} already REPAID; skipping (idempotent).`,
-      );
-      return SettlementResult.ALREADY_REPAID;
-    }
-    throw new UnexpectedInvoiceStatusError(invoiceId, existing.status);
+
+    return result;
   }
 }
