@@ -2,6 +2,7 @@ import { Injectable, Logger } from '@nestjs/common';
 import { InvoiceStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
 import { WebhookDispatchService } from '../webhooks/webhook-dispatch.service';
+import { appendInvoiceEvent } from '../invoices/invoice-event.service';
 
 export enum SettlementResult {
   /** The invoice transitioned FUNDED -> REPAID. */
@@ -52,6 +53,7 @@ export class SettlementService {
   async settleInvoice(
     invoiceId: string,
     ledger: number,
+    txHash?: string,
   ): Promise<SettlementResult> {
     const onchainId = BigInt(invoiceId);
 
@@ -69,6 +71,13 @@ export class SettlementService {
         this.logger.log(
           `Invoice ${invoiceId} settled (FUNDED -> REPAID) at ledger ${ledger}`,
         );
+        await appendInvoiceEvent(tx, {
+          invoiceOnchainId: onchainId,
+          previousStatus: InvoiceStatus.FUNDED,
+          newStatus: InvoiceStatus.REPAID,
+          actorId: 'settlement-sync-service',
+          txHash,
+        });
         return SettlementResult.SETTLED;
       }
 

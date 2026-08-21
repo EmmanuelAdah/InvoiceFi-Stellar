@@ -67,7 +67,7 @@ describe('SettlementSyncService.syncOnce', () => {
     const summary = await service.syncOnce();
 
     expect(events.fetchEvents).toHaveBeenCalledWith(101);
-    expect(settlement.settleInvoice).toHaveBeenCalledWith('7', 105);
+    expect(settlement.settleInvoice).toHaveBeenCalledWith('7', 105, undefined);
     expect(summary).toEqual({ processed: 1, settled: 1 });
     expect(cursor.setLastLedger).toHaveBeenCalledWith(110);
   });
