@@ -121,7 +121,12 @@ export class SettlementSyncService implements OnModuleInit {
       processed++;
       try {
         const result = await withRetry(
-          () => this.applyEventAtomically(parsed.invoiceId, parsed.ledger, event.ledger),
+          () =>
+            this.settlement.settleInvoice(
+              parsed.invoiceId,
+              parsed.ledger,
+              parsed.txHash,
+            ),
           {
             maxAttempts: this.maxAttempts,
             baseDelayMs: this.baseDelayMs,
