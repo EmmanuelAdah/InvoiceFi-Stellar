@@ -3,6 +3,9 @@ resolver = "2"
 members = [
     "invoice",
     "financing-pool",
+    "settlement",
+    "access-control",
+    "upgrade_test_framework",
 ]
 
 [workspace.package]

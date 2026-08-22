@@ -1,5 +1,6 @@
-import { Injectable, Logger, Inject, OnModuleDestroy } from '@nestjs/common';
-import Redis from 'ioredis';
+import { Injectable, OnModuleInit, OnModuleDestroy, Logger, Inject } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
+import { createClient, RedisClientType } from 'redis';
 
 export interface IdempotencyRecord {
   response: any;
@@ -9,30 +10,37 @@ export interface IdempotencyRecord {
 }
 
 @Injectable()
-export class RedisService implements OnModuleDestroy {
+export class RedisService implements OnModuleInit, OnModuleDestroy {
+  private client: RedisClientType;
   private readonly logger = new Logger(RedisService.name);
-  private readonly client: Redis;
+  private isConnected = false;
 
-  constructor() {
-    const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
-    this.client = new Redis(redisUrl, {
-      retryStrategy: (times) => {
-        const delay = Math.min(times * 50, 2000);
-        return delay;
-      },
-    });
+  constructor(private config: ConfigService) {}
 
+  async onModuleInit(): Promise<void> {
+    const redisUrl = this.config.get('REDIS_URL') || 'redis://localhost:6379';
+    this.client = createClient({ url: redisUrl });
+    this.client.on('error', (err) => this.logger.error('Redis error', err));
     this.client.on('connect', () => {
+      this.isConnected = true;
       this.logger.log('Redis connected');
     });
-
-    this.client.on('error', (error) => {
-      this.logger.error(`Redis error: ${error.message}`);
+    this.client.on('disconnect', () => {
+      this.isConnected = false;
+      this.logger.log('Redis disconnected');
     });
+    await this.client.connect();
   }
 
-  async onModuleDestroy() {
-    await this.client.quit();
+  async onModuleDestroy(): Promise<void> {
+    if (this.client) await this.client.quit();
+  }
+
+  getClient(): RedisClientType {
+    if (!this.isConnected) {
+      this.logger.warn('Redis client not connected; operations may fail');
+    }
+    return this.client;
   }
 
   /**
@@ -54,7 +62,7 @@ export class RedisService implements OnModuleDestroy {
   async set(key: string, value: any, ttlSeconds?: number): Promise<void> {
     const serialized = JSON.stringify(value);
     if (ttlSeconds) {
-      await this.client.setex(key, ttlSeconds, serialized);
+      await this.client.setEx(key, ttlSeconds, serialized);
     } else {
       await this.client.set(key, serialized);
     }
@@ -65,7 +73,10 @@ export class RedisService implements OnModuleDestroy {
    */
   async setIfNotExists(key: string, value: any, ttlSeconds: number): Promise<boolean> {
     const serialized = JSON.stringify(value);
-    const result = await this.client.set(key, serialized, 'EX', ttlSeconds, 'NX');
+    const result = await this.client.set(key, serialized, {
+      EX: ttlSeconds,
+      NX: true,
+    });
     return result === 'OK';
   }
 
@@ -80,8 +91,8 @@ export class RedisService implements OnModuleDestroy {
    * Check if a key exists
    */
   async exists(key: string): Promise<boolean> {
-    const result = await this.client.exists(key);
-    return result === 1;
+    const result = await this.client.get(key);
+    return result !== null;
   }
 
   /**

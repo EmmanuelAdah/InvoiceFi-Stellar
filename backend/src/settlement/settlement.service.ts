@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { InvoiceStatus } from '@prisma/client';
 import { PrismaService } from '../prisma/prisma.service';
+import { WebhookDispatchService } from '../webhooks/webhook-dispatch.service';
+import { appendInvoiceEvent } from '../invoices/invoice-event.service';
 
 export enum SettlementResult {
   /** The invoice transitioned FUNDED -> REPAID. */
@@ -29,7 +31,10 @@ export class UnexpectedInvoiceStatusError extends Error {
 export class SettlementService {
   private readonly logger = new Logger(SettlementService.name);
 
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly webhookDispatch: WebhookDispatchService,
+  ) {}
 
   /**
    * Apply an on-chain settlement to the database, transitioning the invoice
@@ -39,14 +44,20 @@ export class SettlementService {
    * so concurrent calls cannot double-apply. The operation is idempotent: a
    * replayed or retried event for an already-REPAID invoice resolves to
    * {@link SettlementResult.ALREADY_REPAID} instead of erroring.
+   *
+   * On a fresh settlement, enqueues a `repaid` webhook event for any
+   * registered subscribers. Enqueueing only writes a queue row (see
+   * `WebhookDispatchService`), so a broken subscriber can never fail or
+   * delay settlement itself.
    */
   async settleInvoice(
     invoiceId: string,
     ledger: number,
+    txHash?: string,
   ): Promise<SettlementResult> {
     const onchainId = BigInt(invoiceId);
 
-    return this.prisma.$transaction(async (tx) => {
+    const result = await this.prisma.db.$transaction(async (tx) => {
       const updated = await tx.invoice.updateMany({
         where: { onchainId, status: InvoiceStatus.FUNDED },
         data: {
@@ -60,6 +71,13 @@ export class SettlementService {
         this.logger.log(
           `Invoice ${invoiceId} settled (FUNDED -> REPAID) at ledger ${ledger}`,
         );
+        await appendInvoiceEvent(tx, {
+          invoiceOnchainId: onchainId,
+          previousStatus: InvoiceStatus.FUNDED,
+          newStatus: InvoiceStatus.REPAID,
+          actorId: 'settlement-sync-service',
+          txHash,
+        });
         return SettlementResult.SETTLED;
       }
 
@@ -76,5 +94,16 @@ export class SettlementService {
       }
       throw new UnexpectedInvoiceStatusError(invoiceId, existing.status);
     });
+
+    if (result === SettlementResult.SETTLED) {
+      await this.webhookDispatch.dispatchInvoiceEvent({
+        invoiceId,
+        event: 'repaid',
+        timestamp: new Date().toISOString(),
+        data: { ledger },
+      });
+    }
+
+    return result;
   }
 }

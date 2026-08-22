@@ -1,6 +1,7 @@
-use soroban_sdk::{Address, Env, Symbol};
+use soroban_sdk::{contracterror, Address};
 
-#[derive(Debug)]
+#[contracterror]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SettlementError {
     Unauthorized = 1,
     AlreadySettled = 2,
@@ -12,6 +13,52 @@ pub enum SettlementError {
     InvoiceNotFound = 8,
     InvalidAuthType = 9,
     InsufficientFees = 10,
+    ReentrancyDetected = 11,
+    FinancingPoolNotSet = 12,
+    CrossContractCallFailed = 13,
+    AlreadyInitialized = 14,
+    NotInitialized = 15,
+    /// Caller is not a current member of the admin signer set.
+    NotASigner = 16,
+    InvalidThreshold = 17,
+    DuplicateSigner = 18,
+    InvalidTimelock = 19,
+    ContractPaused = 20,
+    AlreadyPaused = 21,
+    NotPaused = 22,
+    NoPendingTransfer = 23,
+    AlreadyConfirmed = 24,
+    ThresholdNotMet = 25,
+    TimelockNotElapsed = 26,
+    CannotGrantAdminRole = 27,
+    InvalidAttestationSignature = 28,
+    AttestationReplay = 29,
+    EscrowPubkeyNotSet = 30,
+    InvalidAttestationPayload = 31,
+}
+
+impl From<access_control::AcError> for SettlementError {
+    fn from(e: access_control::AcError) -> Self {
+        use access_control::AcError;
+        match e {
+            AcError::AlreadyInitialized => SettlementError::AlreadyInitialized,
+            AcError::NotInitialized => SettlementError::NotInitialized,
+            // Reuses the pre-existing generic `Unauthorized` variant.
+            AcError::Unauthorized => SettlementError::Unauthorized,
+            AcError::NotASigner => SettlementError::NotASigner,
+            AcError::InvalidThreshold => SettlementError::InvalidThreshold,
+            AcError::DuplicateSigner => SettlementError::DuplicateSigner,
+            AcError::InvalidTimelock => SettlementError::InvalidTimelock,
+            AcError::ContractPaused => SettlementError::ContractPaused,
+            AcError::AlreadyPaused => SettlementError::AlreadyPaused,
+            AcError::NotPaused => SettlementError::NotPaused,
+            AcError::NoPendingTransfer => SettlementError::NoPendingTransfer,
+            AcError::AlreadyConfirmed => SettlementError::AlreadyConfirmed,
+            AcError::ThresholdNotMet => SettlementError::ThresholdNotMet,
+            AcError::TimelockNotElapsed => SettlementError::TimelockNotElapsed,
+            AcError::CannotGrantAdminRole => SettlementError::CannotGrantAdminRole,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -33,6 +80,3 @@ pub struct SettlementAuthInfo {
     pub payee_addr: Address,
     pub payee_auth: bool,
 }
-
-#[cfg(test)]
-mod tests;

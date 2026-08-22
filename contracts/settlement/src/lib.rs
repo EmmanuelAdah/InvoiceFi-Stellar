@@ -1,25 +1,36 @@
 pub mod nonce;
-
 pub mod error;
 pub mod types;
 
 pub use error::{SettlementError, SettlementStatus};
-pub use types::{InvoiceRecord, NonceMeta, StorageKey};
+pub use types::{InvoiceRecord, NonceMeta, StorageKey, ReentrancyGuard};
 
-use soroban_sdk::{contract, contractimpl, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, panic_with_error, Address, BytesN, Env, Symbol, Vec};
 
 use crate::error::SettlementError;
-use crate::types::{NonceMeta, StorageKey};
+use crate::types::{AttestationRecord, NonceMeta, PriceAttestation, StorageKey, ReentrancyGuard};
+use access_control::{AcError, AccessControl, MultisigConfig, PendingAdminTransfer, Role};
+
+/// Unwrap an [`access_control`] result, translating any [`AcError`] into the
+/// contract's own typed [`SettlementError`] via a host trap. Every entry
+/// point here returns `()`/`Option<T>` rather than `Result`, so this is how
+/// role/multisig failures still surface as a specific, decodable error code
+/// to callers instead of an opaque string panic.
+fn unwrap_ac<T>(e: &Env, result: Result<T, AcError>) -> T {
+    match result {
+        Ok(v) => v,
+        Err(err) => panic_with_error!(e, SettlementError::from(err)),
+    }
+}
 
 pub trait SettlementTrait {
-    fn init(e: Env, admin: Address);
+    fn init(e: Env, signers: Vec<Address>, threshold: u32, timelock_ledgers: u32);
     fn get_settlement_status(e: Env, invoice_id: Symbol) -> Option<u32>;
     fn get_settlement_auth_info(
         e: Env,
         invoice_id: Symbol,
         auth_count: u32,
     ) -> Option<(Address, bool)>;
-    fn get_admin(e: Env) -> Option<Address>;
     fn get_fee_rate(e: Env) -> Option<u32>;
     fn get_collected_fees(e: Env) -> Option<i128>;
     fn get_withdrawn_fees(e: Env) -> Option<i128>;
@@ -41,6 +52,12 @@ pub trait SettlementTrait {
     );
     fn set_fee_rate(e: Env, caller: Address, fee_rate: u32);
     fn set_escrow_pubkey(e: Env, caller: Address, pubkey_bytes: soroban_sdk::BytesN<32>);
+    fn submit_attestation(
+        e: Env,
+        caller: Address,
+        payload_bytes: soroban_sdk::Bytes,
+        sig_bytes: soroban_sdk::BytesN<64>,
+    );
     fn settlement_auth(
         e: Env,
         caller: Address,
@@ -53,6 +70,8 @@ pub trait SettlementTrait {
     fn withdraw_fees(e: Env, caller: Address, to: Address, amount: i128);
     fn get_invoice(e: Env, invoice_id: Symbol) -> Option<crate::types::InvoiceRecord>;
     fn get_used_nonces(e: Env, invoice_id: Symbol) -> soroban_sdk::Vec<u64>;
+    fn set_financing_pool_address(e: Env, caller: Address, pool_address: Address);
+    fn get_financing_pool_address(e: Env) -> Option<Address>;
 
     fn settle_invoice(
         e: Env,
@@ -62,6 +81,22 @@ pub trait SettlementTrait {
         amount: i128,
         auth_type: u32,
     );
+
+    // ---- access control ---------------------------------------------------
+
+    fn multisig(e: Env) -> MultisigConfig;
+    fn is_signer(e: Env, addr: Address) -> bool;
+    fn has_role(e: Env, role: Role, addr: Address) -> bool;
+    fn is_paused(e: Env) -> bool;
+    fn grant_role(e: Env, caller: Address, role: Role, grantee: Address);
+    fn revoke_role(e: Env, caller: Address, role: Role, grantee: Address);
+    fn pause(e: Env, caller: Address);
+    fn unpause(e: Env, caller: Address);
+    fn propose_admin_transfer(e: Env, caller: Address, new_signers: Vec<Address>, new_threshold: u32);
+    fn confirm_admin_transfer(e: Env, caller: Address);
+    fn execute_admin_transfer(e: Env, caller: Address);
+    fn cancel_admin_transfer(e: Env, caller: Address);
+    fn pending_admin_transfer(e: Env) -> Option<PendingAdminTransfer>;
 }
 
 #[contract]
@@ -69,11 +104,8 @@ pub struct SettlementContract;
 
 #[contractimpl]
 impl SettlementTrait for SettlementContract {
-    fn init(e: Env, admin: Address) {
-        admin.require_auth();
-        e.storage()
-            .instance()
-            .set(&StorageKey::instance("ADMIN"), &admin);
+    fn init(e: Env, signers: Vec<Address>, threshold: u32, timelock_ledgers: u32) {
+        unwrap_ac(&e, AccessControl::initialize(&e, signers, threshold, timelock_ledgers));
         e.storage()
             .instance()
             .set(&StorageKey::instance("FEE_RATE"), &0u32);
@@ -83,6 +115,10 @@ impl SettlementTrait for SettlementContract {
         e.storage()
             .instance()
             .set(&StorageKey::instance("WITHDRAWN_FEES"), &0i128);
+        // Initialize reentrancy guard as unlocked
+        e.storage()
+            .instance()
+            .set(&StorageKey::ReentrancyGuard, &ReentrancyGuard::Unlocked);
     }
 
     fn get_settlement_status(e: Env, invoice_id: Symbol) -> Option<u32> {
@@ -99,12 +135,6 @@ impl SettlementTrait for SettlementContract {
         e.storage()
             .persistent()
             .get(&StorageKey::invoice_auth0(&invoice_id))
-    }
-
-    fn get_admin(e: Env) -> Option<Address> {
-        e.storage()
-            .instance()
-            .get(&StorageKey::instance("ADMIN"))
     }
 
     fn get_fee_rate(e: Env) -> Option<u32> {
@@ -142,16 +172,7 @@ impl SettlementTrait for SettlementContract {
         caller: Address,
         _payers: soroban_sdk::Vec<Address>,
     ) {
-        caller.require_auth();
-
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&StorageKey::instance("ADMIN"))
-            .expect("not initialized");
-        if caller != admin {
-            panic!("Err: NOT_ADMIN");
-        }
+        unwrap_ac(&e, AccessControl::require_admin(&e, &caller));
 
         e.events().publish(
             (Symbol::new(&e, "settlement"), Symbol::new(&e, "payers_set")),
@@ -164,16 +185,7 @@ impl SettlementTrait for SettlementContract {
         caller: Address,
         _financiers: soroban_sdk::Vec<Address>,
     ) {
-        caller.require_auth();
-
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&StorageKey::instance("ADMIN"))
-            .expect("not initialized");
-        if caller != admin {
-            panic!("Err: NOT_ADMIN");
-        }
+        unwrap_ac(&e, AccessControl::require_admin(&e, &caller));
 
         e.events().publish(
             (Symbol::new(&e, "settlement"), Symbol::new(&e, "financiers_set")),
@@ -191,16 +203,7 @@ impl SettlementTrait for SettlementContract {
         due_date: u64,
         _interest_rate: u32,
     ) {
-        caller.require_auth();
-
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&StorageKey::instance("ADMIN"))
-            .expect("not initialized");
-        if caller != admin {
-            panic!("Err: NOT_ADMIN");
-        }
+        unwrap_ac(&e, AccessControl::require_admin(&e, &caller));
 
         let record = crate::types::InvoiceRecord {
             id: invoice_id.clone(),
@@ -230,16 +233,7 @@ impl SettlementTrait for SettlementContract {
     }
 
     fn set_fee_rate(e: Env, caller: Address, fee_rate: u32) {
-        caller.require_auth();
-
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&StorageKey::instance("ADMIN"))
-            .expect("not initialized");
-        if caller != admin {
-            panic!("Err: NOT_ADMIN");
-        }
+        unwrap_ac(&e, AccessControl::require_admin(&e, &caller));
 
         e.storage()
             .instance()
@@ -256,16 +250,7 @@ impl SettlementTrait for SettlementContract {
         caller: Address,
         pubkey_bytes: soroban_sdk::BytesN<32>,
     ) {
-        caller.require_auth();
-
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&StorageKey::instance("ADMIN"))
-            .expect("not initialized");
-        if caller != admin {
-            panic!("Err: NOT_ADMIN");
-        }
+        unwrap_ac(&e, AccessControl::require_admin(&e, &caller));
 
         e.storage()
             .instance()
@@ -349,16 +334,8 @@ impl SettlementTrait for SettlementContract {
     }
 
     fn withdraw_fees(e: Env, caller: Address, to: Address, amount: i128) {
-        caller.require_auth();
-
-        let admin: Address = e
-            .storage()
-            .instance()
-            .get(&StorageKey::instance("ADMIN"))
-            .expect("not initialized");
-        if caller != admin {
-            panic!("Err: NOT_ADMIN");
-        }
+        unwrap_ac(&e, AccessControl::require_admin(&e, &caller));
+        unwrap_ac(&e, AccessControl::require_not_paused(&e));
 
         let collected: i128 = e
             .storage()
@@ -404,15 +381,45 @@ impl SettlementTrait for SettlementContract {
         nm.used_nonces.clone()
     }
 
+    fn set_financing_pool_address(e: Env, caller: Address, pool_address: Address) {
+        unwrap_ac(&e, AccessControl::require_admin(&e, &caller));
+        e.storage()
+            .instance()
+            .set(&StorageKey::FinancingPoolAddress, &pool_address);
+        e.events().publish(
+            (Symbol::new(&e, "settlement"), Symbol::new(&e, "financing_pool_set")),
+            (pool_address,),
+        );
+    }
+
+    fn get_financing_pool_address(e: Env) -> Option<Address> {
+        e.storage()
+            .instance()
+            .get(&StorageKey::FinancingPoolAddress)
+    }
+
     fn settle_invoice(
         e: Env,
         caller: Address,
         invoice_id: Symbol,
         nonce: u64,
         amount: i128,
-        auth_type: u32,
+        _auth_type: u32,
     ) {
         caller.require_auth();
+        unwrap_ac(&e, AccessControl::require_not_paused(&e));
+
+        // SAFETY: Reentrancy guard check before any state changes
+        // This prevents reentrant calls from external contracts
+        let guard: ReentrancyGuard = e
+            .storage()
+            .instance()
+            .get(&StorageKey::ReentrancyGuard)
+            .unwrap_or(ReentrancyGuard::Unlocked);
+        if guard == ReentrancyGuard::Locked {
+            panic!("Err: REENTRANCY_DETECTED");
+        }
+        
         let nm = NonceMeta::load(&e, &invoice_id);
         if !nm.is_valid(&e, nonce) {
             panic!("Err: NONCE_REPLAY");
@@ -441,6 +448,7 @@ impl SettlementTrait for SettlementContract {
         let fee = (amount * fee_rate as i128) / 10000;
         let net = amount - fee;
 
+        // CHECKS-EFFECTS-INTERACTIONS: Update state before external calls
         let collected: i128 = e
             .storage()
             .instance()
@@ -452,7 +460,8 @@ impl SettlementTrait for SettlementContract {
 
         let new_principal = record.principal_paid + net;
         record.principal_paid = new_principal;
-        if new_principal >= record.amount {
+        let is_fully_settled = new_principal >= record.amount;
+        if is_fully_settled {
             record.status = crate::error::SettlementStatus::Settled as u32;
         }
 
@@ -463,12 +472,101 @@ impl SettlementTrait for SettlementContract {
         let nonce_key = StorageKey::nonce_meta(&invoice_id);
         e.storage().persistent().set(&nonce_key, &nm2);
 
+        // SAFETY: Set reentrancy guard before cross-contract call
+        e.storage()
+            .instance()
+            .set(&StorageKey::ReentrancyGuard, &ReentrancyGuard::Locked);
+
+        // SAFETY: Cross-contract call to financing pool to notify of settlement
+        // Risk: Financing pool could re-enter this contract
+        // Mitigation: Reentrancy guard is active, state already updated
+        // Call ordering: State updated before this call (checks-effects-interactions)
+        if let Some(pool_address) = e.storage().instance().get(&StorageKey::FinancingPoolAddress) {
+            // Note: In production, this would use soroban_sdk::invoke_contract
+            // For now, we emit an event that the backend can use to orchestrate
+            e.events().publish(
+                (Symbol::new(&e, "settlement"), Symbol::new(&e, "notify_financing_pool")),
+                (invoice_id.clone(), pool_address, amount, net),
+            );
+        }
+
+        // SAFETY: Release reentrancy guard after cross-contract call
+        e.storage()
+            .instance()
+            .set(&StorageKey::ReentrancyGuard, &ReentrancyGuard::Unlocked);
+
         e.events().publish(
             (Symbol::new(&e, "settlement"), Symbol::new(&e, "settled")),
             (invoice_id, caller, amount, nonce, fee, net, new_principal),
         );
     }
+
+    // ---- access control ---------------------------------------------------
+
+    fn multisig(e: Env) -> MultisigConfig {
+        unwrap_ac(&e, AccessControl::multisig(&e))
+    }
+
+    fn is_signer(e: Env, addr: Address) -> bool {
+        AccessControl::is_signer(&e, &addr)
+    }
+
+    fn has_role(e: Env, role: Role, addr: Address) -> bool {
+        AccessControl::has_role(&e, role, &addr)
+    }
+
+    fn is_paused(e: Env) -> bool {
+        AccessControl::is_paused(&e)
+    }
+
+    fn grant_role(e: Env, caller: Address, role: Role, grantee: Address) {
+        unwrap_ac(&e, AccessControl::grant_role(&e, &caller, role, grantee));
+    }
+
+    fn revoke_role(e: Env, caller: Address, role: Role, grantee: Address) {
+        unwrap_ac(&e, AccessControl::revoke_role(&e, &caller, role, grantee));
+    }
+
+    fn pause(e: Env, caller: Address) {
+        unwrap_ac(&e, AccessControl::pause(&e, &caller));
+    }
+
+    fn unpause(e: Env, caller: Address) {
+        unwrap_ac(&e, AccessControl::unpause(&e, &caller));
+    }
+
+    fn propose_admin_transfer(
+        e: Env,
+        caller: Address,
+        new_signers: Vec<Address>,
+        new_threshold: u32,
+    ) {
+        unwrap_ac(
+            &e,
+            AccessControl::propose_admin_transfer(&e, &caller, new_signers, new_threshold),
+        );
+    }
+
+    fn confirm_admin_transfer(e: Env, caller: Address) {
+        unwrap_ac(&e, AccessControl::confirm_admin_transfer(&e, &caller));
+    }
+
+    fn execute_admin_transfer(e: Env, caller: Address) {
+        unwrap_ac(&e, AccessControl::execute_admin_transfer(&e, &caller));
+    }
+
+    fn cancel_admin_transfer(e: Env, caller: Address) {
+        unwrap_ac(&e, AccessControl::cancel_admin_transfer(&e, &caller));
+    }
+
+    fn pending_admin_transfer(e: Env) -> Option<PendingAdminTransfer> {
+        AccessControl::pending_admin_transfer(&e)
+    }
 }
 
 #[cfg(test)]
 pub mod tests;
+#[cfg(test)]
+mod reentrancy_tests;
+#[cfg(test)]
+mod upgrade_tests;
