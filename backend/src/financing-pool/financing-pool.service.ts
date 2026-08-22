@@ -1,64 +1,88 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, NotFoundException, ConflictException, Logger } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { SorobanService } from '../soroban/soroban.service';
-import { ContractError, ContractErrorCode } from '../common/contract-error';
-import { FundInvoiceDto } from './dto/funding.dto';
+import { FundResponseDto } from './dto';
 
 @Injectable()
 export class FinancingPoolService {
-  constructor(private prisma: PrismaService, private soroban: SorobanService) {}
+  private readonly logger = new Logger(FinancingPoolService.name);
 
-  async fundInvoice(investorId: string, investorWallet: string, dto: FundInvoiceDto) {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly sorobanService: SorobanService,
+  ) {}
+
+  async fundInvoice(
+    userId: string,
+    invoiceId: string,
+  ): Promise<FundResponseDto> {
+    // 1. Find the invoice
     const invoice = await this.prisma.invoice.findUnique({
-      where: { id: dto.invoiceId },
-      include: { funding: true },
+      where: { id: invoiceId },
     });
 
-    if (!invoice) throw new NotFoundException(`Invoice ${dto.invoiceId} not found`);
-
-    // Guard: already funded
-    if (invoice.funding) {
-      throw new ContractError(ContractErrorCode.DuplicateFunding, 'Invoice has already been funded');
+    if (!invoice) {
+      throw new NotFoundException(`Invoice ${invoiceId} not found`);
     }
 
-    // Guard: expired
-    if (new Date() > invoice.expiresAt) {
-      throw new ContractError(ContractErrorCode.InvoiceExpired, 'Invoice has passed its expiry timestamp');
+    // 2. Check if already funded
+    if (invoice.funded) {
+      throw new ConflictException('Invoice already funded');
     }
 
-    // Guard: insufficient funds (caller must pass their balance for verification)
-    if (dto.amount > invoice.amount) {
-      throw new ContractError(ContractErrorCode.InsufficientFunds, 'Funding amount exceeds invoice value');
+    // 3. Check if user is authorized (must be the buyer)
+    if (invoice.buyerId !== userId) {
+      throw new ForbiddenException('Only the buyer can fund this invoice');
     }
 
-    // Invoke on-chain contract when contractId is present
-    if (invoice.contractId) {
-      try {
-        await this.soroban.fundInvoice({
-          invoiceContractId: invoice.contractId,
-          investorWallet,
-          amount: dto.amount,
-        });
-      } catch (err) {
-        throw this.soroban.parseContractError((err as Error).message);
-      }
+    // 4. Check if invoice is in correct state
+    if (invoice.status !== 'verified') {
+      throw new BadRequestException('Invoice must be verified before funding');
     }
 
-    const [funding] = await this.prisma.$transaction([
-      this.prisma.funding.create({
+    try {
+      // 5. Execute Soroban contract call
+      const txResult = await this.sorobanService.fundInvoice(
+        invoiceId,
+        invoice.amount,
+        invoice.asset,
+      );
+
+      // 6. Update invoice in database
+      const updatedInvoice = await this.prisma.invoice.update({
+        where: { id: invoiceId },
         data: {
-          invoiceId: invoice.id,
-          investorId,
-          amount: dto.amount,
-          discountRate: dto.discountRate,
+          funded: true,
+          fundedAt: new Date(),
+          fundedTxHash: txResult.hash,
+          status: 'funded',
         },
-      }),
-      this.prisma.invoice.update({
-        where: { id: invoice.id },
-        data: { status: 'FUNDED' },
-      }),
-    ]);
+      });
 
-    return funding;
+      this.logger.log(
+        `Invoice ${invoiceId} funded by user ${userId} with tx ${txResult.hash}`
+      );
+
+      return {
+        success: true,
+        invoiceId: updatedInvoice.id,
+        txHash: txResult.hash,
+        message: 'Invoice funded successfully',
+        fundedAt: updatedInvoice.fundedAt!,
+      };
+    } catch (error) {
+      this.logger.error(
+        `Failed to fund invoice ${invoiceId}: ${error.message}`
+      );
+      
+      // If the error is a contract revert, handle it gracefully
+      if (error.message.includes('revert')) {
+        throw new BadRequestException(
+          `Contract reverted: ${error.message}`
+        );
+      }
+      
+      throw error;
+    }
   }
 }
