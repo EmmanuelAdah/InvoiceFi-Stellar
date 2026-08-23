@@ -17,6 +17,7 @@ const customJestConfig = {
     // not by jest.
     '<rootDir>/__tests__/offline/',
     // Shared axe helper module — not a test suite.
+    // Utility/helper files inside __tests__ that are not test suites
     '<rootDir>/__tests__/a11y/axe.utils.ts',
   ],
   coveragePathIgnorePatterns: ['<rootDir>/.next/', '<rootDir>/node_modules/'],
