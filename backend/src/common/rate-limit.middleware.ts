@@ -1,7 +1,16 @@
-import { Injectable, NestMiddleware, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import {
+  Injectable,
+  NestMiddleware,
+  HttpException,
+  HttpStatus,
+  Logger,
+  Optional,
+} from '@nestjs/common';
+import { JwtService } from '@nestjs/jwt';
 import { Request, Response, NextFunction } from 'express';
 import { RateLimiterService, RateLimitType, RateLimitResult } from './rate-limiter.service';
 import { ConfigService } from '@nestjs/config';
+import { VaultService } from '../config/vault/vault.service';
 
 declare global {
   namespace Express {
@@ -18,23 +27,33 @@ declare global {
  * throttled to prevent a single wallet from exhausting contract resources.
  */
 const WALLET_ENDPOINTS: Array<{ method: string; path: string }> = [
-  { method: 'POST', path: '/api/financing-pool/fund' },
-  { method: 'POST', path: '/api/settlement/settle' },
+  { method: 'POST', path: '/financing-pool/fund' },
+  { method: 'POST', path: '/settlement/settle' },
 ];
+
+interface AuthenticatedRequestUser {
+  userId?: string;
+  walletAddress?: string;
+}
+
+interface JwtRateLimitPayload {
+  sub?: string;
+  walletAddress?: string;
+}
 
 /**
  * RateLimitMiddleware enforces three independent sliding-window counters
- * in a single pass.  All three checks run for every request; the first
- * counter that exceeds its limit causes an immediate 429.
+ * in a single pass. Anonymous requests use the IP counter, authenticated
+ * requests use the user counter, and matching mutation routes add a wallet
+ * counter. The first applicable counter that exceeds its limit causes 429.
  *
  * Counter precedence (highest → lowest):
  *   1. Wallet  – POST /financing-pool/fund and POST /settlement/settle only
  *   2. User    – any request that carries a resolved userId
  *   3. IP      – fallback for unauthenticated / unresolved requests
  *
- * The wallet and user counters are checked on top of (not instead of) the
- * IP counter so that a wallet/user burst cannot also exhaust the shared IP
- * quota from behind a proxy.
+ * The IP and user counters are independent keys; wallet checks are added to
+ * authenticated mutation requests without sharing quota with either tier.
  */
 @Injectable()
 export class RateLimitMiddleware implements NestMiddleware {
@@ -44,6 +63,8 @@ export class RateLimitMiddleware implements NestMiddleware {
   constructor(
     private rateLimiter: RateLimiterService,
     private config: ConfigService,
+    @Optional() private jwtService?: JwtService,
+    @Optional() private vault?: VaultService,
   ) {
     this.enableRateLimit = this.config.get('ENABLE_RATE_LIMITING') !== 'false';
   }
@@ -52,20 +73,13 @@ export class RateLimitMiddleware implements NestMiddleware {
     if (!this.enableRateLimit) return next();
 
     const clientIp = this.getClientIp(req);
-    const userId = req.userId;
-    const walletAddress = req.walletAddress;
+    const { userId, walletAddress } = this.resolveIdentity(req);
     const isWalletEndpoint = this.isWalletEndpoint(req);
 
     try {
-      // ── Tier 1: per-IP (always checked) ─────────────────────────────────
-      const ipResult = await this.rateLimiter.checkLimit(clientIp, 'ip');
-      this.applyHeaders(res, 'ip', ipResult);
-      if (!ipResult.allowed) {
-        this.reject(res, ipResult, 'IP');
-        return;
-      }
-
-      // ── Tier 2: per-user (authenticated requests only) ───────────────────
+      // ── Tier 1: anonymous per-IP / authenticated per-user ────────────────
+      // These are mutually exclusive tiers: authenticated traffic is keyed
+      // by its verified user ID, while anonymous traffic is keyed by IP.
       if (userId) {
         const userResult = await this.rateLimiter.checkLimit(userId, 'user');
         this.applyHeaders(res, 'user', userResult);
@@ -73,9 +87,16 @@ export class RateLimitMiddleware implements NestMiddleware {
           this.reject(res, userResult, 'user');
           return;
         }
+      } else {
+        const ipResult = await this.rateLimiter.checkLimit(clientIp, 'ip');
+        this.applyHeaders(res, 'ip', ipResult);
+        if (!ipResult.allowed) {
+          this.reject(res, ipResult, 'IP');
+          return;
+        }
       }
 
-      // ── Tier 3: per-wallet (Soroban-mutating endpoints only) ─────────────
+      // ── Tier 2: per-wallet (Soroban-mutating endpoints only) ─────────────
       if (isWalletEndpoint && walletAddress) {
         const walletResult = await this.rateLimiter.checkLimit(walletAddress, 'wallet');
         this.applyHeaders(res, 'wallet', walletResult);
@@ -117,7 +138,8 @@ export class RateLimitMiddleware implements NestMiddleware {
    *   - X-RateLimit-Tier to tell the client which counter triggered
    */
   private reject(res: Response, result: RateLimitResult, tier: string): never {
-    const retryAfter = result.retryAfter ?? 60;
+    const retryAfter =
+      result.retryAfter ?? Math.max(1, Math.ceil((result.resetAt - Date.now()) / 1000));
     res.setHeader('Retry-After', retryAfter.toString());
     res.setHeader('X-RateLimit-Tier', tier);
     throw new HttpException(
@@ -145,10 +167,49 @@ export class RateLimitMiddleware implements NestMiddleware {
     return req.socket.remoteAddress || 'unknown';
   }
 
+  /**
+   * Resolve identity after authentication has already populated req.user, or
+   * verify the bearer token here because Nest middleware runs before guards.
+   * Invalid/missing credentials deliberately fall back to the IP tier; the
+   * authentication guard remains responsible for returning 401.
+   */
+  private resolveIdentity(req: Request): AuthenticatedRequestUser {
+    const requestUser = (req as Request & { user?: AuthenticatedRequestUser }).user;
+    let userId = req.userId ?? requestUser?.userId;
+    let walletAddress = req.walletAddress ?? requestUser?.walletAddress;
+
+    const token = this.getBearerToken(req);
+    if ((!userId || !walletAddress) && token && this.jwtService && this.vault) {
+      try {
+        const payload = this.jwtService.verify<JwtRateLimitPayload>(token, {
+          secret: this.vault.auth.jwt_secret,
+        });
+        userId ??= payload.sub;
+        walletAddress ??= payload.walletAddress;
+      } catch {
+        // Do not turn an invalid token into a rate-limit error. The auth guard
+        // will reject it after this middleware has applied the IP tier.
+      }
+    }
+
+    return { userId, walletAddress };
+  }
+
+  private getBearerToken(req: Request): string | undefined {
+    const authorization = req.headers.authorization;
+    if (typeof authorization !== 'string') return undefined;
+    const [scheme, token] = authorization.split(' ');
+    return scheme?.toLowerCase() === 'bearer' && token ? token : undefined;
+  }
+
   /** Return true when the request targets a Soroban-mutating endpoint. */
   private isWalletEndpoint(req: Request): boolean {
+    // Support deployments with and without the optional /api prefix.
+    const path = req.path.replace(/^\/api(?=\/|$)/, '');
     return WALLET_ENDPOINTS.some(
-      (e) => e.method === req.method && req.path.startsWith(e.path),
+      (e) =>
+        e.method === req.method &&
+        (path === e.path || path.startsWith(`${e.path}/`)),
     );
   }
 

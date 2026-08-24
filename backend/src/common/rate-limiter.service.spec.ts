@@ -19,7 +19,7 @@ function buildMockRedisClient(
     return store.get(key)!;
   };
 
-  return {
+  const clientMethods = {
     /**
      * Remove members whose score is inside [minScore, maxScore].
      * Passing '-inf' / '+inf' is handled as Number.NEGATIVE_INFINITY / POSITIVE_INFINITY.
@@ -53,9 +53,59 @@ function buildMockRedisClient(
 
     expire: jest.fn().mockResolvedValue(1),
 
+    /** Execute the same atomic contract as the production Lua script. */
+    eval: jest.fn(
+      async (
+        _script: string,
+        options: { keys: string[]; arguments: string[] },
+      ): Promise<number[]> => {
+        const key = options.keys[0];
+        const now = Number(options.arguments[0]);
+        const windowMs = Number(options.arguments[1]);
+        const maxRequests = Number(options.arguments[2]);
+        const windowStart = now - windowMs;
+
+        await Promise.resolve(
+          (clientMethods.zRemRangeByScore as jest.Mock)(
+            key,
+            '-inf',
+            windowStart - 1,
+          ),
+        );
+        const queriedEntries = await Promise.resolve(
+          (clientMethods.zRangeByScoreWithScores as jest.Mock)(
+            key,
+            windowStart,
+            '+inf',
+          ),
+        );
+        const entries = queriedEntries.sort(
+          (a: { score: number }, b: { score: number }) => a.score - b.score,
+        );
+        store.set(key, entries);
+
+        if (entries.length < maxRequests) {
+          await Promise.resolve(
+            (clientMethods.zAdd as jest.Mock)(key, {
+              score: now,
+              value: options.arguments[4],
+            }),
+          );
+          await Promise.resolve(
+            (clientMethods.expire as jest.Mock)(key, Math.ceil(windowMs / 1000) + 1),
+          );
+          return [1, entries.length + 1, now + windowMs, 0];
+        }
+
+        return [0, entries.length, (entries[0]?.score ?? now) + windowMs, 1];
+      },
+    ),
+
     // Expose the in-memory store for assertions
     _store: store,
   };
+
+  return clientMethods;
 }
 
 /** Build a ConfigService mock with explicit overrides. */
@@ -160,6 +210,20 @@ describe('RateLimiterService', () => {
       const call = client.zAdd.mock.calls[0];
       expect(call[0]).toBe('rl:ip:192.0.2.1');
       expect(typeof call[1].score).toBe('number');
+    });
+
+    it('evaluates pruning and reservation atomically in Redis', async () => {
+      const client = buildMockRedisClient();
+      await buildModule(client);
+      await service.checkLimit('192.0.2.1', 'ip');
+
+      expect(client.eval).toHaveBeenCalledWith(
+        expect.stringContaining("ZREMRANGEBYSCORE"),
+        expect.objectContaining({
+          keys: ['rl:ip:192.0.2.1'],
+          arguments: expect.arrayContaining(['60000', '5']),
+        }),
+      );
     });
 
     it('does NOT call zAdd when the limit is exceeded (no ghost writes)', async () => {

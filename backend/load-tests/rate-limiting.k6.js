@@ -10,6 +10,7 @@
  *   RATE_LIMIT_USER_REQUESTS         – user tier max requests per window (default: 1000)
  *   RATE_LIMIT_WALLET_REQUESTS       – wallet tier max requests per window (default: 30)
  *   RATE_LIMIT_WINDOW_MS             – shared window size in ms (default: 60000)
+ *   TEST_JWT_TOKENS                  – comma-separated valid JWTs, one per VU
  *
  * Acceptance criteria
  * -------------------
@@ -19,7 +20,8 @@
  *
  * Run example
  * -----------
- *   k6 run --env BASE_URL=http://localhost:4000 load-tests/rate-limiting.k6.js
+ *   k6 run --env BASE_URL=http://localhost:4000 --env VUS=2 \
+ *     --env TEST_JWT_TOKENS=token-for-vu-1,token-for-vu-2 load-tests/rate-limiting.k6.js
  */
 
 import http from 'k6/http';
@@ -35,6 +37,7 @@ import { textSummary } from 'https://jslib.k6.io/k6-summary/0.0.1/index.js';
 const ip429Rate = new Rate('ip_rate_limited');
 const user429Rate = new Rate('user_rate_limited');
 const wallet429Rate = new Rate('wallet_rate_limited');
+const non429ErrorRate = new Rate('non_429_error');
 
 /** Sanity counter to confirm header presence. */
 const missingHeaderCount = new Counter('missing_ratelimit_headers');
@@ -53,6 +56,8 @@ const BASE_URL = __ENV.BASE_URL || 'http://localhost:4000';
 const IP_LIMIT = parseInt(__ENV.RATE_LIMIT_IP_REQUESTS || '100', 10);
 const USER_LIMIT = parseInt(__ENV.RATE_LIMIT_USER_REQUESTS || '1000', 10);
 const WALLET_LIMIT = parseInt(__ENV.RATE_LIMIT_WALLET_REQUESTS || '30', 10);
+const JWT_TOKENS = (__ENV.TEST_JWT_TOKENS || '').split(',').filter(Boolean);
+const VUS = parseInt(__ENV.VUS || '50', 10);
 
 /**
  * How many rapid-fire requests to send in the burst phase.
@@ -76,21 +81,23 @@ const walletTheoretical = (WALLET_BURST - WALLET_LIMIT) / WALLET_BURST;
 // ---------------------------------------------------------------------------
 
 export const options = {
-  stages: [
-    { duration: '1m', target: 50 },  // ramp up
-    { duration: '3m', target: 50 },  // steady state – validate rate limits
-    { duration: '1m', target: 100 }, // ramp up to 2× for stress
-    { duration: '3m', target: 100 }, // hold – confirm limits still hold
-    { duration: '1m', target: 0 },   // ramp down
-  ],
+  // One isolated burst per VU makes the observed ratio directly comparable
+  // with (burst - limit) / burst instead of mixing later-window 429s into it.
+  scenarios: {
+    rate_limit_burst: {
+      executor: 'per-vu-iterations',
+      vus: VUS,
+      iterations: 1,
+      maxDuration: '10m',
+    },
+  },
 
   thresholds: {
     // ── Response latency ────────────────────────────────────────────────────
     http_req_duration: ['p(95)<500'],
 
-    // ── Overall error rate (non-429 errors only) ────────────────────────────
-    // 429s are expected and excluded via the per-tier rate metrics below.
-    http_req_failed: ['rate<0.05'],
+    // ── Overall error rate (429s are expected) ──────────────────────────────
+    non_429_error: ['rate<0.05'],
 
     // ── IP tier: 429 rate must be within ±5% of theoretical ─────────────────
     // Lower bound: rate must not be TOO LOW (would indicate the limit isn't
@@ -123,19 +130,33 @@ export const options = {
 // ---------------------------------------------------------------------------
 
 export default function () {
-  // Each VU uses a unique token so user/wallet counters are per-identity,
-  // matching how the middleware keys on userId / walletAddress.
-  const vuToken = `test-token-${__VU}`;
-  const authHeaders = { Authorization: `Bearer ${vuToken}` };
-  const jsonHeaders = { 'Content-Type': 'application/json', ...authHeaders };
+  // Each VU must use a valid, distinct token so user/wallet counters are
+  // measured per identity instead of counting invalid requests as IP traffic.
+  if (!JWT_TOKENS[__VU - 1]) {
+    throw new Error('TEST_JWT_TOKENS must contain one valid JWT per VU');
+  }
+  const vuToken = JWT_TOKENS[__VU - 1];
+  // Keep metric groups on distinct source addresses so deployments that
+  // combine identity tiers do not cross-contaminate the burst measurements.
+  const ipHeaders = { 'X-Forwarded-For': `198.51.100.${__VU}` };
+  const authHeaders = {
+    Authorization: `Bearer ${vuToken}`,
+    'X-Forwarded-For': `203.0.113.${__VU}`,
+  };
+  const jsonHeaders = {
+    'Content-Type': 'application/json',
+    Authorization: `Bearer ${vuToken}`,
+    'X-Forwarded-For': `192.0.2.${__VU}`,
+  };
 
   // ── Tier 1: per-IP (unauthenticated) ──────────────────────────────────────
   group('IP tier – per-IP rate limit', () => {
     for (let i = 0; i < IP_BURST; i++) {
-      const res = http.get(`${BASE_URL}/health`);
+      const res = http.get(`${BASE_URL}/health`, { headers: ipHeaders });
       const is429 = res.status === 429;
 
-      ip429Rate.add(is429);
+      if (__ITER === 0) ip429Rate.add(is429);
+      non429ErrorRate.add(res.status !== 200 && res.status !== 429);
 
       check(res, {
         'IP tier: status is 200 or 429': (r) => r.status === 200 || r.status === 429,
@@ -160,7 +181,8 @@ export default function () {
       const res = http.get(`${BASE_URL}/api/invoices`, { headers: authHeaders });
       const is429 = res.status === 429;
 
-      user429Rate.add(is429);
+      if (__ITER === 0) user429Rate.add(is429);
+      non429ErrorRate.add(![200, 401].includes(res.status) && res.status !== 429);
 
       check(res, {
         'User tier: status is 200, 401, or 429': (r) =>
@@ -190,7 +212,8 @@ export default function () {
       );
       const is429 = res.status === 429;
 
-      wallet429Rate.add(is429);
+      if (__ITER === 0) wallet429Rate.add(is429);
+      non429ErrorRate.add(![200, 201, 400, 401].includes(res.status) && res.status !== 429);
 
       check(res, {
         'Wallet tier: status is 200, 201, 400, 401, or 429': (r) =>
@@ -219,6 +242,7 @@ export default function () {
         payload,
         { headers: jsonHeaders },
       );
+      non429ErrorRate.add(![200, 201, 400, 401].includes(res.status) && res.status !== 429);
 
       check(res, {
         'Settlement wallet tier: status is 200, 201, 400, 401, or 429': (r) =>
